@@ -1,0 +1,201 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Validation Blueprint: AnalysisRecord
+    function isValidAnalysisRecord(data) {
+      return data.keys().hasAll([
+        'ownerId',
+        'videoId',
+        'videoTitle',
+        'scope',
+        'startTimecode',
+        'endTimecode',
+        'startOffset',
+        'endOffset',
+        'fps',
+        'thinkingLevel',
+        'prompt',
+        'answer',
+        'model',
+        'clientCreatedAt',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'ownerId',
+        'videoId',
+        'videoTitle',
+        'scope',
+        'startTimecode',
+        'endTimecode',
+        'startOffset',
+        'endOffset',
+        'fps',
+        'thinkingLevel',
+        'prompt',
+        'answer',
+        'model',
+        'clientCreatedAt',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.ownerId is string &&
+      data.ownerId.size() >= 1 &&
+      data.ownerId.size() <= 128 &&
+      data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.ownerId == request.auth.uid &&
+      data.videoId is string &&
+      data.videoId.size() >= 1 &&
+      data.videoId.size() <= 256 &&
+      data.videoTitle is string &&
+      data.videoTitle.size() >= 1 &&
+      data.videoTitle.size() <= 300 &&
+      data.scope is string &&
+      data.scope.size() >= 4 &&
+      data.scope.size() <= 16 &&
+      (data.scope == 'full' || data.scope == 'scene') &&
+      data.startTimecode is string &&
+      data.startTimecode.size() <= 32 &&
+      data.endTimecode is string &&
+      data.endTimecode.size() <= 32 &&
+      data.startOffset is string &&
+      data.startOffset.size() <= 32 &&
+      data.endOffset is string &&
+      data.endOffset.size() <= 32 &&
+      (data.fps is int || data.fps is float) &&
+      data.fps > 0 &&
+      data.fps <= 24 &&
+      data.thinkingLevel is string &&
+      data.thinkingLevel.size() >= 3 &&
+      data.thinkingLevel.size() <= 16 &&
+      (data.thinkingLevel == 'LOW' || data.thinkingLevel == 'MEDIUM' || data.thinkingLevel == 'HIGH') &&
+      data.prompt is string &&
+      data.prompt.size() >= 1 &&
+      data.prompt.size() <= 4000 &&
+      data.answer is string &&
+      data.answer.size() >= 1 &&
+      data.answer.size() <= 50000 &&
+      data.model is string &&
+      data.model.size() >= 1 &&
+      data.model.size() <= 120 &&
+      data.clientCreatedAt is string &&
+      data.clientCreatedAt.size() >= 1 &&
+      data.clientCreatedAt.size() <= 64 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: SceneBreakdownRecord
+    function isValidSceneBreakdownRecord(data) {
+      return data.keys().hasAll([
+        'ownerId',
+        'videoId',
+        'videoTitle',
+        'scenes',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'ownerId',
+        'videoId',
+        'videoTitle',
+        'scenes',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.ownerId is string &&
+      data.ownerId.size() >= 1 &&
+      data.ownerId.size() <= 128 &&
+      data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.ownerId == request.auth.uid &&
+      data.videoId is string &&
+      data.videoId.size() >= 1 &&
+      data.videoId.size() <= 256 &&
+      data.videoTitle is string &&
+      data.videoTitle.size() >= 1 &&
+      data.videoTitle.size() <= 300 &&
+      data.scenes is list &&
+      data.scenes.size() <= 50 &&
+      (data.scenes.size() == 0 || data.scenes[0] is map) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    match /analyses/{analysisId} {
+      allow get: if isVerifiedUser() && isValidId(analysisId) && existing().ownerId == request.auth.uid;
+      allow list: if isVerifiedUser() && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(analysisId) &&
+        isValidAnalysisRecord(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(analysisId) &&
+        isValidAnalysisRecord(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().videoId == existing().videoId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly(['prompt', 'answer', 'videoTitle', 'updatedAt'])
+        );
+
+      allow delete: if isVerifiedUser() && isValidId(analysisId) && existing().ownerId == request.auth.uid;
+    }
+
+    match /sceneBreakdowns/{breakdownId} {
+      allow get: if isVerifiedUser() && isValidId(breakdownId) && existing().ownerId == request.auth.uid;
+      allow list: if isVerifiedUser() && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(breakdownId) &&
+        isValidSceneBreakdownRecord(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(breakdownId) &&
+        isValidSceneBreakdownRecord(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().videoId == existing().videoId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly(['scenes', 'videoTitle', 'updatedAt'])
+        );
+
+      allow delete: if isVerifiedUser() && isValidId(breakdownId) && existing().ownerId == request.auth.uid;
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "KinoScope Studio — Análisis Cinematográfico con Gemini 4 Argon",
+  "description": "Plataforma de análisis cinematográfico profundo mediante la File API de Gemini (hasta 2GB) y el modelo gemini-4-argon para consultas sobre películas completas o escenas acotadas por código de tiempo.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

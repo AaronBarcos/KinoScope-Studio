@@ -1,0 +1,178 @@
+{
+  "entities": {
+    "AnalysisRecord": {
+      "title": "AnalysisRecord",
+      "description": "Stores an AI video analysis chat or query record created by a user for a video or scene.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the user who owns this analysis."
+        },
+        "videoId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Identifier of the analyzed video."
+        },
+        "videoTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "Display name of the analyzed video."
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["full", "scene"],
+          "minLength": 4,
+          "maxLength": 16,
+          "description": "Temporal scope of the analysis (full video or bounded scene)."
+        },
+        "startTimecode": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Start timecode MM:SS or empty string when scope is full."
+        },
+        "endTimecode": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "End timecode MM:SS or empty string when scope is full."
+        },
+        "startOffset": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Gemini start offset string (e.g. 15s) or empty string."
+        },
+        "endOffset": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Gemini end offset string (e.g. 60s) or empty string."
+        },
+        "fps": {
+          "type": "number",
+          "description": "Frame sampling density used for the analysis."
+        },
+        "thinkingLevel": {
+          "type": "string",
+          "enum": ["LOW", "MEDIUM", "HIGH"],
+          "minLength": 3,
+          "maxLength": 16,
+          "description": "Gemini thinking level used."
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000,
+          "description": "User prompt or question sent to the AI."
+        },
+        "answer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 50000,
+          "description": "AI analysis response text."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Model identifier used for the analysis."
+        },
+        "clientCreatedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "ISO date-time string when the analysis was created."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the document was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the document was last updated."
+        }
+      },
+      "required": [
+        "ownerId",
+        "videoId",
+        "videoTitle",
+        "scope",
+        "startTimecode",
+        "endTimecode",
+        "startOffset",
+        "endOffset",
+        "fps",
+        "thinkingLevel",
+        "prompt",
+        "answer",
+        "model",
+        "clientCreatedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SceneBreakdownRecord": {
+      "title": "SceneBreakdownRecord",
+      "description": "Stores an AI-generated scene breakdown table for a specific video owned by a user.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the owner."
+        },
+        "videoId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Identifier of the video."
+        },
+        "videoTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "Display name of the video."
+        },
+        "scenes": {
+          "type": "array",
+          "description": "Bounded list of detected scenes (max 50 scenes)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the breakdown was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the breakdown was last updated."
+        }
+      },
+      "required": [
+        "ownerId",
+        "videoId",
+        "videoTitle",
+        "scenes",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/analyses/{analysisId}": {
+      "schema": "AnalysisRecord",
+      "description": "Collection of saved AI video analysis chats/queries per user."
+    },
+    "/sceneBreakdowns/{breakdownId}": {
+      "schema": "SceneBreakdownRecord",
+      "description": "Collection of saved AI scene breakdowns per video and user."
+    }
+  }
+}
