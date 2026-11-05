@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Film,
   Upload,
@@ -9,6 +9,7 @@ import {
   HardDrive,
   CheckCircle2,
   Clock,
+  FolderKanban,
 } from 'lucide-react';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import {
@@ -85,6 +86,26 @@ export default function KinoScopeStudioPage() {
       breakdownsByVideo[activeVideo.name] ||
       []
     : [];
+
+  const activeVideoCitations = useMemo(() => {
+    if (!activeVideo) return [];
+    const seen = new Set<number>();
+    const list: Array<{ label: string; seconds: number }> = [];
+    for (const a of analyses) {
+      if (
+        a.videoId === activeVideo.id ||
+        a.videoTitle === activeVideo.displayName
+      ) {
+        for (const cit of a.citations || []) {
+          if (!seen.has(cit.seconds)) {
+            seen.add(cit.seconds);
+            list.push(cit);
+          }
+        }
+      }
+    }
+    return list.sort((a, b) => a.seconds - b.seconds);
+  }, [analyses, activeVideo]);
 
   const activeDurationSec = activeVideo?.durationSeconds || 60;
   const rawStartSec = parseTimecodeToSeconds(startTimecode) ?? 0;
@@ -362,7 +383,7 @@ export default function KinoScopeStudioPage() {
     }
 
     setStatusNotice(
-      `Archivo de vídeo "${file.name}" vinculado correctamente para reproducción en pantalla.`
+      `Archivo de vídeo "${file.name}" vinculado correctamente para reproducción en el Monitor de Programa.`
     );
   };
 
@@ -617,7 +638,7 @@ export default function KinoScopeStudioPage() {
         }
 
         setStatusNotice(
-          `Desglose guardado: ${detectedScenes.length} escenas detectadas con gemini-4-argon (Thinking ${thinkingLevel}).`
+          `Desglose guardado en Timeline: ${detectedScenes.length} escenas detectadas con gemini-4-argon (Thinking ${thinkingLevel}).`
         );
       }
     } catch (err: unknown) {
@@ -687,43 +708,43 @@ export default function KinoScopeStudioPage() {
   const totalUsedBytes = videos.reduce((acc, v) => acc + (v.sizeBytes || 0), 0);
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-950 text-slate-100">
-      {/* Strict 3-Zone Top Bar Contract */}
-      <header className="flex items-center justify-between gap-8 px-6 py-3.5 border-b border-slate-800 bg-slate-950/90 sticky top-0 z-30 backdrop-blur">
+    <div className="min-h-screen lg:h-screen lg:overflow-hidden flex flex-col bg-[#050609] text-slate-100">
+      {/* Strict 3-Zone Top Bar Contract (Styled as NLE Application Header) */}
+      <header className="flex items-center justify-between gap-6 px-4 py-2 border-b border-slate-800/90 bg-[#0a0c11] shrink-0 z-30">
         {/* Zone 1: Single text element wordmark */}
         <a
           href="#top"
-          className="text-lg font-display font-bold tracking-tight text-white whitespace-nowrap shrink-0"
+          className="text-sm font-display font-bold tracking-tight text-white whitespace-nowrap shrink-0"
         >
           KinoScope Studio
         </a>
 
-        {/* Zone 2: 4 concise single-line text navigation links */}
+        {/* Zone 2: 4 concise single-line text navigation links (NLE Workspace Tabs) */}
         <nav
           aria-label="Navegación principal del estudio"
-          className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400"
+          className="hidden md:flex items-center gap-1 p-0.5 rounded bg-[#05070a] border border-slate-800/90 text-xs font-medium text-slate-400"
         >
           <a
             href="#monitor-section"
-            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+            className="px-3 py-1 rounded-sm bg-[#141821] text-amber-400 hover:text-white transition-colors whitespace-nowrap shrink-0"
           >
             Monitor
           </a>
           <a
             href="#desglose-section"
-            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+            className="px-3 py-1 rounded-sm hover:bg-slate-900 hover:text-white transition-colors whitespace-nowrap shrink-0"
           >
             Desglose
           </a>
           <a
             href="#consultas-section"
-            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+            className="px-3 py-1 rounded-sm hover:bg-slate-900 hover:text-white transition-colors whitespace-nowrap shrink-0"
           >
             Consultas IA
           </a>
           <a
             href="#vault-section"
-            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+            className="px-3 py-1 rounded-sm hover:bg-slate-900 hover:text-white transition-colors whitespace-nowrap shrink-0"
           >
             Archivo File API
           </a>
@@ -734,19 +755,19 @@ export default function KinoScopeStudioPage() {
           <button
             type="button"
             onClick={() => setIsUploadModalOpen(true)}
-            className="px-4 py-2 text-xs font-semibold text-slate-950 bg-amber-500 rounded-lg hover:bg-amber-400 transition-colors whitespace-nowrap shrink-0"
+            className="px-3.5 py-1.5 text-xs font-semibold text-slate-950 bg-amber-500 rounded hover:bg-amber-400 transition-colors whitespace-nowrap shrink-0"
           >
             Subir Vídeo (Hasta 2GB)
           </button>
         </div>
       </header>
 
-      {/* Main Studio Workspace Layout */}
-      <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 py-6">
+      {/* Main NLE Docked Workspace (Premiere Pro / DaVinci Resolve Multi-Panel Layout) */}
+      <main className="flex-1 min-h-0 w-full p-1.5 flex flex-col gap-1.5 lg:overflow-hidden">
         {statusNotice && (
-          <div className="mb-4 flex items-center justify-between gap-4 rounded-lg border border-slate-800 bg-slate-900 px-4 py-2.5 text-xs text-slate-200">
+          <div className="flex items-center justify-between gap-4 rounded border border-slate-800 bg-[#10131a] px-3 py-1.5 text-xs text-slate-200 shrink-0">
             <span className="flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
               <span>{statusNotice}</span>
             </span>
             <button
@@ -759,74 +780,97 @@ export default function KinoScopeStudioPage() {
           </div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Left Column (3 cols on lg): File API Vault & Uploaded Reels */}
+        {/* 3-Column Docked NLE Grid:
+            - Left (col-span-3 / xl:col-span-2): Media Pool & File Upload
+            - Center (col-span-5 / xl:col-span-7): Program Monitor (Center Top) + Multi-Track Timeline & EDL (Bottom)
+            - Right (col-span-4 / xl:col-span-3): AI Analysis Inspector */}
+        <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 gap-1.5 items-stretch">
+          {/* =================================================================
+              LEFT DOCK: NLE PROJECT MEDIA POOL & FILE API UPLOAD
+             ================================================================= */}
           <section
             id="vault-section"
             aria-label="Archivo de bobinas en Gemini File API"
-            className="lg:col-span-3 space-y-4"
+            className="lg:col-span-3 xl:col-span-2 lg:h-full min-h-0 flex flex-col gap-1.5"
           >
-            <div className="border border-slate-800 bg-slate-900/70 rounded-xl p-4 space-y-4">
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <h2 className="text-sm font-display font-semibold text-white">
-                    Bobinas en File API
-                  </h2>
-                  <p className="text-xs text-slate-400 font-mono tabular-nums mt-0.5">
-                    Capacidad máx: 2.00 GB / vídeo
-                  </p>
-                </div>
+            <div className="flex-1 min-h-0 border border-slate-800/90 bg-[#10131a] rounded-md overflow-hidden flex flex-col shadow-lg">
+              {/* NLE Panel Tab Header */}
+              <div className="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-slate-800/90 bg-[#0a0c11] shrink-0">
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 -my-1.5 border-t-2 border-amber-500 bg-[#141821] text-slate-100 font-medium text-[11px] tracking-wide">
+                  <FolderKanban className="w-3 h-3 text-amber-400 shrink-0" />
+                  <span>Proyecto · Medios</span>
+                </span>
+
                 <button
                   type="button"
                   onClick={() => handleSyncFileApiVault(false)}
                   disabled={isSyncingVault}
                   aria-label="Sincronizar archivos con Gemini File API"
-                  className="p-2 rounded-lg border border-slate-800 bg-slate-950 text-slate-300 hover:text-white hover:border-slate-700 transition-colors"
+                  title="Sincronizar con Gemini File API"
+                  className="p-1 rounded border border-slate-800 bg-slate-900 text-slate-300 hover:text-white hover:border-slate-700 transition-colors"
                 >
                   <RefreshCw
-                    className={`w-3.5 h-3.5 ${
+                    className={`w-3 h-3 ${
                       isSyncingVault ? 'animate-spin text-amber-400' : ''
                     }`}
                   />
                 </button>
               </div>
 
-              {/* Storage Quota Meter */}
-              <div className="p-3 rounded-lg border border-slate-800 bg-slate-950 space-y-1.5">
-                <div className="flex items-center justify-between text-xs font-mono tabular-nums">
-                  <span className="flex items-center gap-1.5 text-slate-300">
-                    <HardDrive className="w-3.5 h-3.5 text-amber-400" />
-                    <span>Volumen Activo</span>
-                  </span>
-                  <span className="text-slate-200">
-                    {formatByteSize(totalUsedBytes)} / 2.00 GB
-                  </span>
-                </div>
-                <div className="h-1.5 w-full rounded-full bg-slate-800 overflow-hidden">
-                  <div
-                    style={{
-                      width: `${Math.min(
-                        100,
-                        Math.max(
-                          0,
-                          (totalUsedBytes / (2 * 1024 * 1024 * 1024)) * 100
-                        )
-                      )}%`,
-                    }}
-                    className="h-full bg-amber-400"
-                  />
+              {/* Media Pool Toolbar & Upload Action */}
+              <div className="p-2.5 space-y-2.5 border-b border-slate-800/80 bg-[#0c0f16] shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setIsUploadModalOpen(true)}
+                  className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded border border-amber-500/50 bg-amber-500/15 text-xs font-semibold text-amber-300 hover:bg-amber-500 hover:text-slate-950 transition-colors whitespace-nowrap shrink-0"
+                >
+                  <Upload className="w-3.5 h-3.5 shrink-0" />
+                  <span>Importar / Subir Vídeo</span>
+                </button>
+
+                {/* Storage Quota Meter */}
+                <div className="p-2 rounded border border-slate-800/90 bg-[#07090d] space-y-1">
+                  <div className="flex items-center justify-between text-[10px] font-mono tabular-nums">
+                    <span className="flex items-center gap-1 text-slate-400">
+                      <HardDrive className="w-3 h-3 text-amber-400" />
+                      <span>File API</span>
+                    </span>
+                    <span className="text-slate-200">
+                      {formatByteSize(totalUsedBytes)} / 2.00 GB
+                    </span>
+                  </div>
+                  <div className="h-1 w-full rounded-full bg-slate-800 overflow-hidden">
+                    <div
+                      style={{
+                        width: `${Math.min(
+                          100,
+                          Math.max(
+                            0,
+                            (totalUsedBytes / (2 * 1024 * 1024 * 1024)) * 100
+                          )
+                        )}%`,
+                      }}
+                      className="h-full bg-amber-400"
+                    />
+                  </div>
                 </div>
               </div>
 
-              {/* Reel List */}
-              <div className="space-y-2">
+              {/* Media Bin Reel List (Scrollable) */}
+              <div className="flex-1 min-h-0 overflow-y-auto p-2.5 space-y-1.5">
+                <div className="flex items-center justify-between text-[10px] font-mono uppercase tracking-wider text-slate-500 px-1">
+                  <span>Clips en Secuencia ({videos.length})</span>
+                  <span>Máx 2GB</span>
+                </div>
+
                 {videos.length === 0 ? (
-                  <div className="p-4 rounded-lg border border-dashed border-slate-800 bg-slate-950/40 text-center space-y-1">
+                  <div className="p-4 rounded border border-dashed border-slate-800 bg-[#080a0f] text-center space-y-1.5 my-1">
+                    <Film className="w-5 h-5 text-slate-600 mx-auto" />
                     <p className="text-xs text-slate-300 font-medium">
-                      No hay vídeos registrados
+                      Bandeja de medios vacía
                     </p>
-                    <p className="text-[11px] text-slate-500">
-                      Sube un archivo de hasta 2GB o pulsa sincronizar para
+                    <p className="text-[11px] text-slate-500 leading-snug">
+                      Importa un archivo de hasta 2GB o pulsa sincronizar para
                       cargar tus vídeos de Gemini File API.
                     </p>
                   </div>
@@ -835,19 +879,20 @@ export default function KinoScopeStudioPage() {
                     const isSelected = vid.id === activeVideo?.id;
                     const savedCount = analyses.filter(
                       (a) =>
-                        a.videoId === vid.id || a.videoTitle === vid.displayName
+                        a.videoId === vid.id ||
+                        a.videoTitle === vid.displayName
                     ).length;
 
                     return (
                       <div
                         key={vid.id}
-                        className={`p-3 rounded-lg border transition-colors ${
+                        className={`p-2 rounded border transition-colors ${
                           isSelected
-                            ? 'border-amber-500/70 bg-slate-800/90 shadow-sm'
-                            : 'border-slate-800 bg-slate-950/60 hover:border-slate-700'
+                            ? 'border-amber-500/80 bg-[#171c28] shadow-sm'
+                            : 'border-slate-800/90 bg-[#090b10] hover:border-slate-700'
                         }`}
                       >
-                        <div className="flex items-start justify-between gap-2">
+                        <div className="flex items-start justify-between gap-1.5">
                           <button
                             type="button"
                             onClick={() => handleSelectVideo(vid)}
@@ -855,9 +900,11 @@ export default function KinoScopeStudioPage() {
                           >
                             <div className="flex items-center gap-1.5 text-xs font-medium text-slate-100 truncate">
                               <Film className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                              <span className="truncate">{vid.displayName}</span>
+                              <span className="truncate">
+                                {vid.displayName}
+                              </span>
                             </div>
-                            <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] font-mono tabular-nums text-slate-400">
+                            <div className="mt-1 flex flex-wrap items-center gap-1 text-[10px] font-mono tabular-nums text-slate-400">
                               <span className="whitespace-nowrap">
                                 {formatByteSize(vid.sizeBytes)}
                               </span>
@@ -865,7 +912,9 @@ export default function KinoScopeStudioPage() {
                                 <>
                                   <span aria-hidden="true">·</span>
                                   <span className="whitespace-nowrap text-amber-300">
-                                    {formatSecondsToTimecode(vid.durationSeconds)}
+                                    {formatSecondsToTimecode(
+                                      vid.durationSeconds
+                                    )}
                                   </span>
                                 </>
                               )}
@@ -873,7 +922,7 @@ export default function KinoScopeStudioPage() {
                                 <>
                                   <span aria-hidden="true">·</span>
                                   <span className="whitespace-nowrap text-emerald-400">
-                                    {savedCount} análisis
+                                    {savedCount} IA
                                   </span>
                                 </>
                               )}
@@ -896,9 +945,9 @@ export default function KinoScopeStudioPage() {
                             type="button"
                             onClick={() => handleDeleteVideo(vid)}
                             aria-label={`Eliminar ${vid.displayName}`}
-                            className="p-1 text-slate-500 hover:text-red-400 transition-colors"
+                            className="p-1 text-slate-500 hover:text-red-400 transition-colors shrink-0"
                           >
-                            <Trash2 className="w-3.5 h-3.5" />
+                            <Trash2 className="w-3 h-3" />
                           </button>
                         </div>
                       </div>
@@ -907,39 +956,34 @@ export default function KinoScopeStudioPage() {
                 )}
               </div>
 
-              <button
-                type="button"
-                onClick={() => setIsUploadModalOpen(true)}
-                className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg border border-slate-700 bg-slate-950 text-xs font-medium text-slate-200 hover:border-amber-500/50 hover:text-white transition-colors whitespace-nowrap shrink-0"
-              >
-                <Upload className="w-3.5 h-3.5 text-amber-400" />
-                <span>Subir Nuevo Vídeo a File API</span>
-              </button>
-            </div>
-
-            {/* Technical Guide Card for Gemini 4 Argon Video Understanding */}
-            <div className="border border-slate-800 bg-slate-900/50 rounded-xl p-4 space-y-2.5 text-xs text-slate-400">
-              <h3 className="font-display font-semibold text-slate-200 text-xs flex items-center gap-1.5">
-                <Clock className="w-3.5 h-3.5 text-amber-400" />
-                <span>Arquitectura File API + Argon</span>
-              </h3>
-              <p className="leading-relaxed">
-                Los archivos subidos mediante{' '}
-                <code className="font-mono text-slate-200">ai.files.upload</code>{' '}
-                se almacenan hasta 48h en la infraestructura de Gemini y admiten
-                recortes dinámicos sin re-subir el vídeo usando{' '}
-                <code className="font-mono text-slate-200">videoMetadata</code> (
-                <code className="font-mono text-amber-300">startOffset</code>,{' '}
-                <code className="font-mono text-amber-300">endOffset</code>,{' '}
-                <code className="font-mono text-amber-300">fps</code>) y control
-                de razonamiento{' '}
-                <code className="font-mono text-amber-300">thinkingLevel</code>.
-              </p>
+              {/* Compact Technical Footer inside Left NLE Media Dock */}
+              <div className="p-2.5 border-t border-slate-800/90 bg-[#080a0f] space-y-1 text-[10px] text-slate-400 shrink-0">
+                <h3 className="font-display font-semibold text-slate-200 text-[11px] flex items-center gap-1.5">
+                  <Clock className="w-3 h-3 text-amber-400 shrink-0" />
+                  <span>Motor File API + Argon</span>
+                </h3>
+                <p className="leading-snug text-slate-400">
+                  Recorte dinámico en timeline mediante{' '}
+                  <code className="font-mono text-amber-300">startOffset</code>{' '}
+                  /{' '}
+                  <code className="font-mono text-amber-300">endOffset</code>,{' '}
+                  <code className="font-mono text-amber-300">fps</code> y{' '}
+                  <code className="font-mono text-amber-300">
+                    thinkingLevel
+                  </code>
+                  .
+                </p>
+              </div>
             </div>
           </section>
 
-          {/* Center Column (5 cols on lg): Cinema Monitor & Scene Breakdown */}
-          <div id="monitor-section" className="lg:col-span-5 space-y-6">
+          {/* =================================================================
+              CENTER DOCK: PROGRAM MONITOR (TOP) + TIMELINE & EDL (BOTTOM)
+             ================================================================= */}
+          <div
+            id="monitor-section"
+            className="lg:col-span-5 xl:col-span-7 lg:h-full min-h-0 flex flex-col gap-1.5 lg:overflow-y-auto"
+          >
             <CinemaMonitor
               video={activeVideo}
               scenes={scenes}
@@ -956,6 +1000,9 @@ export default function KinoScopeStudioPage() {
               onDurationDetected={handleDurationDetected}
               onAttachLocalVideoFile={handleAttachLocalVideoFile}
               onOpenUpload={() => setIsUploadModalOpen(true)}
+              citations={activeVideoCitations}
+              isGeneratingBreakdown={isGeneratingBreakdown}
+              onGenerateBreakdown={handleGenerateBreakdown}
             />
 
             <SceneBreakdownTable
@@ -964,11 +1011,14 @@ export default function KinoScopeStudioPage() {
               onGenerateBreakdown={handleGenerateBreakdown}
               onSeekToScene={(sec) => setCurrentTimeSec(sec)}
               onScopeToScene={handleSelectSceneRange}
+              currentTimeSec={currentTimeSec}
             />
           </div>
 
-          {/* Right Column (4 cols on lg): Gemini 4 Argon Query Inspector */}
-          <div className="lg:col-span-4">
+          {/* =================================================================
+              RIGHT DOCK: GEMINI 4 ARGON AI ANALYSIS INSPECTOR
+             ================================================================= */}
+          <div className="lg:col-span-4 xl:col-span-3 lg:h-full min-h-0 flex flex-col overflow-hidden">
             <AnalysisInspector
               activeVideoId={activeVideo?.id}
               activeVideoTitle={activeVideo?.displayName}
@@ -1014,7 +1064,7 @@ export default function KinoScopeStudioPage() {
           setStartTimecode('00:00');
           setEndTimecode(formatSecondsToTimecode(dur));
           setStatusNotice(
-            `Vídeo "${newVideo.displayName}" registrado en Gemini File API (${newVideo.state}).`
+            `Vídeo "${newVideo.displayName}" importado en Bandeja de Medios y Timeline (${newVideo.state}).`
           );
         }}
       />

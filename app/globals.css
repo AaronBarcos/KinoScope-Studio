@@ -7,3 +7,23 @@
   --font-mono: var(--font-jetbrains-mono), monospace;
 }
 
+/* Custom NLE Dark Studio Scrollbars (Premiere / DaVinci style) */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #090b10;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1e2430;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #333c4d;
+}
+
+
