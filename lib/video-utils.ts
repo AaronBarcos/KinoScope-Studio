@@ -45,6 +45,8 @@ export interface UploadedGeminiVideo {
   localObjectUrl?: string;
   streamUrl?: string;
   hasServerCache?: boolean;
+  isPermanentVault?: boolean;
+  expirationTime?: string;
   createdAt: string;
 }
 
@@ -487,4 +489,49 @@ export function calculateChunkPlan(
   }
   return chunks;
 }
+
+/**
+ * Builds the deterministic server streaming endpoint URL for a video.
+ */
+export function buildVideoStreamUrl(params: {
+  name?: string;
+  uri?: string;
+  displayName?: string;
+  sizeBytes?: number;
+  mimeType?: string;
+}): string {
+  const name = params.name || '';
+  const uri = params.uri || '';
+  const displayName = params.displayName || name || 'video.mp4';
+  const sizeBytes = Number.isFinite(params.sizeBytes) ? Number(params.sizeBytes) : 0;
+  const mimeType = params.mimeType || 'video/mp4';
+
+  return `/api/files/stream?name=${encodeURIComponent(name)}&uri=${encodeURIComponent(uri)}&displayName=${encodeURIComponent(displayName)}&sizeBytes=${sizeBytes}&mimeType=${encodeURIComponent(mimeType)}`;
+}
+
+/**
+ * Resolves the direct playback URL for the center Program Monitor without requiring
+ * the user to manually relink a local file.
+ */
+export function resolveVideoPlaybackUrl(
+  video: Pick<
+    UploadedGeminiVideo,
+    'localObjectUrl' | 'streamUrl' | 'name' | 'uri' | 'displayName' | 'sizeBytes' | 'mimeType'
+  > | null
+): string | undefined {
+  if (!video) return undefined;
+  if (video.localObjectUrl) return video.localObjectUrl;
+  if (video.streamUrl) return video.streamUrl;
+  if (video.name || video.displayName || video.uri) {
+    return buildVideoStreamUrl({
+      name: video.name,
+      uri: video.uri,
+      displayName: video.displayName,
+      sizeBytes: video.sizeBytes,
+      mimeType: video.mimeType,
+    });
+  }
+  return undefined;
+}
+
 

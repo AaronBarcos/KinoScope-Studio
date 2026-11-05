@@ -40,6 +40,7 @@ async function tryFetchFromGeminiFileApi(params: {
         sourceFilePath: tempDownloadPath,
         fileName: params.fileName,
         displayName: params.displayName || params.fileName,
+        uri: params.uri,
         mimeType: params.mimeType || 'video/mp4',
         sizeBytes: stat.size,
       });
@@ -83,6 +84,7 @@ async function tryFetchFromGeminiFileApi(params: {
             sourceFilePath: tempDownloadPath,
             fileName: params.fileName,
             displayName: params.displayName || params.fileName,
+            uri: params.uri,
             mimeType: params.mimeType || contentType || 'video/mp4',
             sizeBytes: arrayBuf.byteLength,
           });
@@ -111,6 +113,7 @@ export async function GET(req: NextRequest) {
 
   let found = await findVideoInServerVault({
     fileName: name,
+    uri,
     displayName,
     sizeBytes: sizeBytesParam,
   });

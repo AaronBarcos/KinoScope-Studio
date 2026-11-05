@@ -3,10 +3,12 @@ import { ThinkingLevel } from '@google/genai';
 import { getGeminiServerClient, GEMINI_VIDEO_MODEL } from '@/lib/gemini-server';
 import {
   buildVideoPart,
+  buildVideoStreamUrl,
   extractTimestampCitations,
   SupportedThinkingLevel,
   validateThinkingLevelForArgon,
 } from '@/lib/video-utils';
+import { ensureActiveGeminiFile } from '@/lib/server-video-vault';
 
 export const runtime = 'nodejs';
 
@@ -33,7 +35,10 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const {
+      fileName,
       fileUri,
+      displayName,
+      sizeBytes,
       mimeType = 'video/mp4',
       prompt,
       scope = 'full',
@@ -42,7 +47,10 @@ export async function POST(req: NextRequest) {
       fps = 1,
       thinkingLevel: rawThinkingLevel = 'MEDIUM',
     } = body as {
+      fileName?: string;
       fileUri?: string;
+      displayName?: string;
+      sizeBytes?: number;
       mimeType?: string;
       prompt?: string;
       scope?: 'full' | 'scene';
@@ -59,9 +67,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (!fileUri || !fileUri.trim()) {
+    if ((!fileUri || !fileUri.trim()) && (!fileName || !fileName.trim())) {
       return NextResponse.json(
-        { error: 'Se requiere un vídeo registrado en File API (fileUri) para realizar el análisis.' },
+        { error: 'Se requiere un vídeo registrado en File API o en la bóveda permanente para realizar el análisis.' },
         { status: 400 }
       );
     }
@@ -80,9 +88,18 @@ export async function POST(req: NextRequest) {
     try {
       const ai = getGeminiServerClient();
 
-      const videoPart = buildVideoPart({
+      // Ensure the Gemini File API resource is ACTIVE (auto-reuploads from permanent vault if >48h expired)
+      const activeFile = await ensureActiveGeminiFile({
+        fileName,
         fileUri,
+        displayName,
         mimeType,
+        sizeBytes,
+      });
+
+      const videoPart = buildVideoPart({
+        fileUri: activeFile.fileUri,
+        mimeType: activeFile.mimeType,
         startOffset: scope === 'scene' ? startOffset : undefined,
         endOffset: scope === 'scene' ? endOffset : undefined,
         fps,
@@ -121,6 +138,24 @@ export async function POST(req: NextRequest) {
         thinkingLevel: resolvedThinkingLevel,
         citations: extractTimestampCitations(answerText),
         usedFileApi: true,
+        refreshedFile: activeFile.refreshed
+          ? {
+              name: activeFile.fileName,
+              uri: activeFile.fileUri,
+              displayName: activeFile.displayName,
+              mimeType: activeFile.mimeType,
+              durationSeconds: activeFile.durationSeconds,
+              createTime: activeFile.createTime,
+              expirationTime: activeFile.expirationTime,
+              streamUrl: buildVideoStreamUrl({
+                name: activeFile.fileName,
+                uri: activeFile.fileUri,
+                displayName: activeFile.displayName,
+                sizeBytes,
+                mimeType: activeFile.mimeType,
+              }),
+            }
+          : undefined,
         videoMetadataApplied: {
           startOffset: scope === 'scene' ? startOffset : undefined,
           endOffset: scope === 'scene' ? endOffset : undefined,

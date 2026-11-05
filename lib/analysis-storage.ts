@@ -16,11 +16,14 @@ import {
 import { db, handleFirestoreError, OperationType } from './firebase';
 import {
   AnalysisQueryRecord,
+  buildVideoStreamUrl,
   extractTimestampCitations,
   SupportedThinkingLevel,
+  UploadedGeminiVideo,
   VideoSceneItem,
 } from './video-utils';
 
+const LOCAL_VIDEOS_KEY = 'kinoscope_saved_videos_v1';
 const LOCAL_ANALYSES_KEY = 'kinoscope_saved_analyses_v1';
 const LOCAL_BREAKDOWNS_KEY = 'kinoscope_saved_breakdowns_v1';
 
@@ -43,6 +46,52 @@ export function sanitizeFirestoreId(rawId: string): string {
   return cleaned.length > 0 && VALID_ID_REGEX.test(cleaned)
     ? cleaned
     : `rec_${Date.now()}`;
+}
+
+export function loadVideosFromLocalStorage(): UploadedGeminiVideo[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(LOCAL_VIDEOS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (item): item is UploadedGeminiVideo =>
+          item &&
+          typeof item.id === 'string' &&
+          typeof item.name === 'string' &&
+          typeof item.displayName === 'string'
+      )
+      .map((item) => ({
+        ...item,
+        localObjectUrl: undefined,
+        streamUrl:
+          item.streamUrl ||
+          buildVideoStreamUrl({
+            name: item.name,
+            uri: item.uri,
+            displayName: item.displayName,
+            sizeBytes: item.sizeBytes,
+            mimeType: item.mimeType,
+          }),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+export function saveVideosToLocalStorage(videos: UploadedGeminiVideo[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const serializable = videos.map((v) => ({
+      ...v,
+      localObjectUrl: undefined,
+    }));
+    window.localStorage.setItem(LOCAL_VIDEOS_KEY, JSON.stringify(serializable));
+  } catch {
+    // Ignore storage quota errors
+  }
 }
 
 export function loadAnalysesFromLocalStorage(): AnalysisQueryRecord[] {

@@ -1,16 +1,23 @@
 'use client';
 
+import {
+  calculateChunkPlan,
+  DEFAULT_CHUNK_SIZE_BYTES,
+} from './video-utils';
+
 const DB_NAME = 'kinoscope_video_vault_db';
 const STORE_NAME = 'video_blobs';
 const DB_VERSION = 1;
 
-interface StoredVideoRecord {
+export interface StoredVideoRecord {
   key: string;
   fileName: string;
   displayName: string;
+  uri?: string;
   sizeBytes: number;
   mimeType: string;
   durationSeconds?: number;
+  aspectRatio?: string;
   blob: Blob;
   updatedAt: number;
 }
@@ -39,9 +46,11 @@ function openVaultDb(): Promise<IDBDatabase | null> {
 export async function cacheVideoBlobInBrowser(params: {
   fileName: string;
   displayName: string;
+  uri?: string;
   sizeBytes: number;
   mimeType: string;
   durationSeconds?: number;
+  aspectRatio?: string;
   blob: Blob;
 }): Promise<void> {
   const db = await openVaultDb();
@@ -58,9 +67,11 @@ export async function cacheVideoBlobInBrowser(params: {
         key: primaryKey,
         fileName: params.fileName,
         displayName: params.displayName,
+        uri: params.uri,
         sizeBytes: params.sizeBytes,
         mimeType: params.mimeType,
         durationSeconds: params.durationSeconds,
+        aspectRatio: params.aspectRatio,
         blob: params.blob,
         updatedAt: Date.now(),
       };
@@ -78,7 +89,12 @@ export async function getCachedVideoFromBrowser(params: {
   fileName?: string;
   displayName?: string;
   sizeBytes?: number;
-}): Promise<{ objectUrl: string; durationSeconds?: number } | null> {
+}): Promise<{
+  objectUrl: string;
+  blob: Blob;
+  durationSeconds?: number;
+  aspectRatio?: string;
+} | null> {
   const db = await openVaultDb();
   if (!db) return null;
 
@@ -104,7 +120,9 @@ export async function getCachedVideoFromBrowser(params: {
     if (rec && rec.blob instanceof Blob && rec.blob.size > 0) {
       return {
         objectUrl: URL.createObjectURL(rec.blob),
+        blob: rec.blob,
         durationSeconds: rec.durationSeconds,
+        aspectRatio: rec.aspectRatio,
       };
     }
   }
@@ -112,20 +130,152 @@ export async function getCachedVideoFromBrowser(params: {
   return null;
 }
 
-export async function removeCachedVideoFromBrowser(fileName: string): Promise<void> {
+export async function listAllCachedVideosFromBrowser(): Promise<
+  Array<{
+    fileName: string;
+    displayName: string;
+    uri?: string;
+    sizeBytes: number;
+    mimeType: string;
+    durationSeconds?: number;
+    aspectRatio?: string;
+    objectUrl: string;
+    blob: Blob;
+    updatedAt: number;
+  }>
+> {
   const db = await openVaultDb();
-  if (!db || !fileName) return;
+  if (!db) return [];
+
+  const records = await new Promise<StoredVideoRecord[]>((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.getAll();
+      req.onsuccess = () => resolve((req.result as StoredVideoRecord[]) || []);
+      req.onerror = () => resolve([]);
+    } catch {
+      resolve([]);
+    }
+  });
+
+  const deduped = new Map<
+    string,
+    {
+      fileName: string;
+      displayName: string;
+      uri?: string;
+      sizeBytes: number;
+      mimeType: string;
+      durationSeconds?: number;
+      aspectRatio?: string;
+      objectUrl: string;
+      blob: Blob;
+      updatedAt: number;
+    }
+  >();
+
+  for (const rec of records) {
+    if (!rec || !(rec.blob instanceof Blob) || rec.blob.size <= 0) continue;
+    // Skip duplicate meta_ keys when the primary record is already present
+    const identityKey = `${rec.displayName.toLowerCase()}_${rec.sizeBytes || rec.blob.size}`;
+    const existing = deduped.get(identityKey);
+    if (!existing || (!rec.key.startsWith('meta_') && rec.updatedAt >= existing.updatedAt)) {
+      if (existing) {
+        URL.revokeObjectURL(existing.objectUrl);
+      }
+      deduped.set(identityKey, {
+        fileName: rec.fileName,
+        displayName: rec.displayName,
+        uri: rec.uri,
+        sizeBytes: rec.sizeBytes || rec.blob.size,
+        mimeType: rec.mimeType || 'video/mp4',
+        durationSeconds: rec.durationSeconds,
+        aspectRatio: rec.aspectRatio,
+        objectUrl: URL.createObjectURL(rec.blob),
+        blob: rec.blob,
+        updatedAt: rec.updatedAt || Date.now(),
+      });
+    }
+  }
+
+  return Array.from(deduped.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+export async function removeCachedVideoFromBrowser(
+  fileName: string,
+  displayName?: string,
+  sizeBytes?: number
+): Promise<void> {
+  const db = await openVaultDb();
+  if (!db) return;
 
   await new Promise<void>((resolve) => {
     try {
       const tx = db.transaction(STORE_NAME, 'readwrite');
-      tx.objectStore(STORE_NAME).delete(fileName);
+      const store = tx.objectStore(STORE_NAME);
+      if (fileName) {
+        store.delete(fileName);
+      }
+      if (displayName && sizeBytes) {
+        store.delete(`meta_${displayName.toLowerCase()}_${sizeBytes}`);
+      }
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();
     } catch {
       resolve();
     }
   });
+}
+
+/**
+ * Background-syncs a browser-cached video Blob to the server's permanent `.kinoscope_vault`
+ * if the server does not yet have it cached.
+ */
+export async function hydrateServerVaultFromBrowserBlob(params: {
+  fileName: string;
+  displayName: string;
+  uri?: string;
+  mimeType: string;
+  durationSeconds?: number;
+  aspectRatio?: string;
+  blob: Blob;
+}): Promise<boolean> {
+  try {
+    const uploadId = `hydrate_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const chunks = calculateChunkPlan(params.blob.size, DEFAULT_CHUNK_SIZE_BYTES);
+
+    for (const chunk of chunks) {
+      const slice = params.blob.slice(chunk.start, chunk.end);
+      const res = await fetch(
+        `/api/files/upload?action=chunk&uploadId=${encodeURIComponent(uploadId)}&chunkIndex=${chunk.index}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: slice,
+        }
+      );
+      if (!res.ok) return false;
+    }
+
+    const finRes = await fetch('/api/files/upload?action=hydrate-vault', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        uploadId,
+        fileName: params.fileName,
+        displayName: params.displayName,
+        uri: params.uri,
+        mimeType: params.mimeType,
+        durationSeconds: params.durationSeconds,
+        aspectRatio: params.aspectRatio,
+      }),
+    });
+
+    return finRes.ok;
+  } catch {
+    return false;
+  }
 }
 
 /**

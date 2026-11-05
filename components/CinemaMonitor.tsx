@@ -25,6 +25,7 @@ import {
 import {
   formatSecondsToTimecode,
   normalizeSceneRange,
+  resolveVideoPlaybackUrl,
   UploadedGeminiVideo,
   VideoSceneItem,
 } from '@/lib/video-utils';
@@ -105,11 +106,8 @@ export function CinemaMonitor({
 
   const isPlaying = Boolean(video && playingVideoId === video.id);
 
-  // Determine playable media URL: prefer local blob URL, then server stream URL when cached on server
-  const playbackUrl = video
-    ? video.localObjectUrl ||
-      (video.hasServerCache ? video.streamUrl : undefined)
-    : undefined;
+  // Determine playable media URL: always resolve local blob URL or direct server stream URL
+  const playbackUrl = resolveVideoPlaybackUrl(video);
 
   const hasStreamError = Boolean(
     video && failedStreamVideoId === video.id && !video.localObjectUrl

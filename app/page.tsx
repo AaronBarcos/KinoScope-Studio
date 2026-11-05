@@ -14,6 +14,7 @@ import {
 import { onAuthStateChanged, User } from 'firebase/auth';
 import {
   AnalysisQueryRecord,
+  buildVideoStreamUrl,
   formatByteSize,
   formatSecondsToTimecode,
   normalizeSceneRange,
@@ -26,6 +27,8 @@ import {
 import {
   cacheVideoBlobInBrowser,
   getCachedVideoFromBrowser,
+  hydrateServerVaultFromBrowserBlob,
+  listAllCachedVideosFromBrowser,
   probeLocalVideoMetadata,
   removeCachedVideoFromBrowser,
 } from '@/lib/client-video-cache';
@@ -38,10 +41,12 @@ import {
   deleteAnalysisFromFirestore,
   loadAnalysesFromLocalStorage,
   loadBreakdownsMapFromLocalStorage,
+  loadVideosFromLocalStorage,
   saveAnalysesToLocalStorage,
   saveAnalysisToFirestore,
   saveBreakdownForVideoLocal,
   saveSceneBreakdownToFirestore,
+  saveVideosToLocalStorage,
   subscribeToUserAnalyses,
   subscribeToUserSceneBreakdowns,
 } from '@/lib/analysis-storage';
@@ -51,7 +56,9 @@ import { AnalysisInspector } from '@/components/AnalysisInspector';
 import { FileUploadModal } from '@/components/FileUploadModal';
 
 export default function KinoScopeStudioPage() {
-  const [videos, setVideos] = useState<UploadedGeminiVideo[]>([]);
+  const [videos, setVideos] = useState<UploadedGeminiVideo[]>(() =>
+    loadVideosFromLocalStorage()
+  );
   const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
   const [breakdownsByVideo, setBreakdownsByVideo] = useState<
     Record<string, VideoSceneItem[]>
@@ -387,100 +394,230 @@ export default function KinoScopeStudioPage() {
     );
   };
 
+  // Persist videos catalog to localStorage whenever it changes
+  useEffect(() => {
+    saveVideosToLocalStorage(videos);
+  }, [videos]);
+
+  const applyRefreshedGeminiFile = useCallback(
+    (
+      oldVideoId: string,
+      refreshed: {
+        name?: string;
+        uri?: string;
+        displayName?: string;
+        mimeType?: string;
+        durationSeconds?: number;
+        expirationTime?: string;
+        streamUrl?: string;
+      }
+    ) => {
+      if (!refreshed.uri) return;
+      setVideos((prev) =>
+        prev.map((v) =>
+          v.id === oldVideoId
+            ? {
+                ...v,
+                name: refreshed.name || v.name,
+                uri: refreshed.uri || v.uri,
+                streamUrl: refreshed.streamUrl || v.streamUrl,
+                durationSeconds: refreshed.durationSeconds || v.durationSeconds,
+                expirationTime: refreshed.expirationTime || v.expirationTime,
+                state: 'ACTIVE',
+                hasServerCache: true,
+                isPermanentVault: true,
+              }
+            : v
+        )
+      );
+    },
+    []
+  );
+
   const handleSyncFileApiVault = useCallback(async (silent = false) => {
     setIsSyncingVault(true);
     if (!silent) setStatusNotice(null);
     try {
-      const res = await fetch('/api/files/status');
-      const data = await res.json();
-      if (res.ok && Array.isArray(data.files)) {
-        const remoteVideos: UploadedGeminiVideo[] = await Promise.all(
-          data.files.map(async (f: Record<string, unknown>) => {
-            const fileName = String(f.name || '');
-            const displayName = String(
-              f.displayName || f.name || 'Vídeo File API'
-            );
-            const sizeBytes = Number(f.sizeBytes || 0);
-            const mimeType = String(f.mimeType || 'video/mp4');
-            const uri = String(f.uri || '');
-            const streamUrl =
-              typeof f.streamUrl === 'string' && f.streamUrl
-                ? f.streamUrl
-                : `/api/files/stream?name=${encodeURIComponent(fileName)}&uri=${encodeURIComponent(uri)}&displayName=${encodeURIComponent(displayName)}&sizeBytes=${sizeBytes}&mimeType=${encodeURIComponent(mimeType)}`;
+      const browserCachedList = await listAllCachedVideosFromBrowser();
+      const res = await fetch('/api/files/status').catch(() => null);
+      const data = res && res.ok ? await res.json().catch(() => null) : null;
+      const remoteFiles: Array<Record<string, unknown>> =
+        data && Array.isArray(data.files) ? data.files : [];
 
-            const cachedBrowser = await getCachedVideoFromBrowser({
+      const remoteVideos: UploadedGeminiVideo[] = await Promise.all(
+        remoteFiles.map(async (f: Record<string, unknown>) => {
+          const fileName = String(f.name || '');
+          const displayName = String(
+            f.displayName || f.name || 'Vídeo File API'
+          );
+          const sizeBytes = Number(f.sizeBytes || 0);
+          const mimeType = String(f.mimeType || 'video/mp4');
+          const uri = String(f.uri || '');
+          const hasServerCache = Boolean(f.hasServerCache);
+          const isPermanentVault = Boolean(f.isPermanentVault || hasServerCache);
+          const streamUrl =
+            typeof f.streamUrl === 'string' && f.streamUrl
+              ? f.streamUrl
+              : buildVideoStreamUrl({
+                  name: fileName,
+                  uri,
+                  displayName,
+                  sizeBytes,
+                  mimeType,
+                });
+
+          const cachedBrowser = await getCachedVideoFromBrowser({
+            fileName,
+            displayName,
+            sizeBytes,
+          });
+
+          // If the browser has the video blob in IndexedDB, but the server vault didn't have it yet, hydrate the server vault in background
+          if (!hasServerCache && cachedBrowser?.blob) {
+            void hydrateServerVaultFromBrowserBlob({
               fileName,
-              displayName,
-              sizeBytes,
-            });
-
-            const remoteDuration =
-              typeof f.durationSeconds === 'number' && f.durationSeconds > 0
-                ? f.durationSeconds
-                : cachedBrowser?.durationSeconds;
-
-            return {
-              id: fileName || `remote-${Math.random()}`,
-              name: fileName,
               displayName,
               uri,
               mimeType,
-              sizeBytes,
-              state:
-                (f.state as 'PROCESSING' | 'ACTIVE' | 'FAILED') || 'ACTIVE',
-              durationSeconds: remoteDuration,
-              localObjectUrl: cachedBrowser?.objectUrl,
-              streamUrl,
-              hasServerCache: Boolean(f.hasServerCache),
-              aspectRatio: '16:9',
-              createdAt: String(f.createTime || new Date().toISOString()),
-            };
-          })
+              durationSeconds:
+                typeof f.durationSeconds === 'number'
+                  ? f.durationSeconds
+                  : cachedBrowser.durationSeconds,
+              aspectRatio: cachedBrowser.aspectRatio,
+              blob: cachedBrowser.blob,
+            });
+          }
+
+          const remoteDuration =
+            typeof f.durationSeconds === 'number' && f.durationSeconds > 0
+              ? f.durationSeconds
+              : cachedBrowser?.durationSeconds;
+
+          return {
+            id: fileName || `remote-${Math.random()}`,
+            name: fileName,
+            displayName,
+            uri,
+            mimeType,
+            sizeBytes,
+            state:
+              (f.state as 'PROCESSING' | 'ACTIVE' | 'FAILED') || 'ACTIVE',
+            durationSeconds: remoteDuration,
+            localObjectUrl: cachedBrowser?.objectUrl,
+            streamUrl,
+            hasServerCache: hasServerCache || Boolean(cachedBrowser?.blob),
+            isPermanentVault: isPermanentVault || Boolean(cachedBrowser?.blob),
+            expirationTime: f.expirationTime
+              ? String(f.expirationTime)
+              : undefined,
+            aspectRatio:
+              (typeof f.aspectRatio === 'string' && f.aspectRatio) ||
+              cachedBrowser?.aspectRatio ||
+              '16:9',
+            createdAt: String(f.createTime || new Date().toISOString()),
+          };
+        })
+      );
+
+      // Include any videos permanently saved in the browser's IndexedDB even if they expired >48h ago in Gemini File API
+      for (const bc of browserCachedList) {
+        const alreadyInRemote = remoteVideos.some(
+          (rv) =>
+            (bc.fileName && rv.name === bc.fileName) ||
+            (rv.displayName.toLowerCase() === bc.displayName.toLowerCase() &&
+              Math.abs(rv.sizeBytes - bc.sizeBytes) < 1024)
         );
+        if (!alreadyInRemote) {
+          const fallbackName =
+            bc.fileName || `files/vault_${bc.displayName.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+          remoteVideos.push({
+            id: fallbackName,
+            name: fallbackName,
+            displayName: bc.displayName,
+            uri: bc.uri || `vault://${fallbackName}`,
+            mimeType: bc.mimeType || 'video/mp4',
+            sizeBytes: bc.sizeBytes,
+            state: 'ACTIVE',
+            durationSeconds: bc.durationSeconds,
+            localObjectUrl: bc.objectUrl,
+            streamUrl: buildVideoStreamUrl({
+              name: fallbackName,
+              uri: bc.uri,
+              displayName: bc.displayName,
+              sizeBytes: bc.sizeBytes,
+              mimeType: bc.mimeType,
+            }),
+            hasServerCache: true,
+            isPermanentVault: true,
+            aspectRatio: bc.aspectRatio || '16:9',
+            createdAt: new Date(bc.updatedAt).toISOString(),
+          });
 
-        setVideos((prev) => {
-          const byName = new Map(prev.map((v) => [v.name, v]));
-          const merged: UploadedGeminiVideo[] = [];
-
-          for (const rv of remoteVideos) {
-            const existing = byName.get(rv.name);
-            if (existing) {
-              merged.push({
-                ...rv,
-                localObjectUrl: existing.localObjectUrl || rv.localObjectUrl,
-                durationSeconds:
-                  existing.durationSeconds || rv.durationSeconds,
-                aspectRatio: existing.aspectRatio || rv.aspectRatio,
-              });
-              byName.delete(rv.name);
-            } else {
-              merged.push(rv);
-            }
-          }
-
-          for (const leftover of byName.values()) {
-            merged.push(leftover);
-          }
-          return merged;
-        });
-
-        if (remoteVideos.length > 0) {
-          setActiveVideoId((prevId) => {
-            if (prevId) return prevId;
-            const first = remoteVideos[0];
-            if (first.durationSeconds) {
-              setStartTimecode('00:00');
-              setEndTimecode(formatSecondsToTimecode(first.durationSeconds));
-            }
-            return first.id;
+          // Ensure server vault also has a copy of this browser-stored video for future File API auto-renewals
+          void hydrateServerVaultFromBrowserBlob({
+            fileName: fallbackName,
+            displayName: bc.displayName,
+            uri: bc.uri,
+            mimeType: bc.mimeType || 'video/mp4',
+            durationSeconds: bc.durationSeconds,
+            aspectRatio: bc.aspectRatio,
+            blob: bc.blob,
           });
         }
+      }
 
-        if (!silent) {
-          setStatusNotice(
-            `Sincronizado con Gemini File API (${remoteVideos.length} archivos remotos verificados).`
-          );
+      setVideos((prev) => {
+        const byName = new Map(prev.map((v) => [v.name, v]));
+        const merged: UploadedGeminiVideo[] = [];
+
+        for (const rv of remoteVideos) {
+          const existing =
+            byName.get(rv.name) ||
+            Array.from(byName.values()).find(
+              (ev) =>
+                ev.displayName.toLowerCase() === rv.displayName.toLowerCase() &&
+                Math.abs((ev.sizeBytes || 0) - (rv.sizeBytes || 0)) < 1024
+            );
+
+          if (existing) {
+            merged.push({
+              ...rv,
+              id: existing.id || rv.id,
+              localObjectUrl: existing.localObjectUrl || rv.localObjectUrl,
+              durationSeconds:
+                existing.durationSeconds || rv.durationSeconds,
+              aspectRatio: existing.aspectRatio || rv.aspectRatio,
+              isPermanentVault: true,
+              hasServerCache: true,
+            });
+            byName.delete(existing.name);
+          } else {
+            merged.push(rv);
+          }
         }
+
+        for (const leftover of byName.values()) {
+          merged.push(leftover);
+        }
+        return merged;
+      });
+
+      if (remoteVideos.length > 0) {
+        setActiveVideoId((prevId) => {
+          if (prevId) return prevId;
+          const first = remoteVideos[0];
+          if (first.durationSeconds) {
+            setStartTimecode('00:00');
+            setEndTimecode(formatSecondsToTimecode(first.durationSeconds));
+          }
+          return first.id;
+        });
+      }
+
+      if (!silent) {
+        setStatusNotice(
+          `Bóveda permanente sincronizada (${remoteVideos.length} vídeos guardados y listos para reproducción directa).`
+        );
       }
     } catch {
       // Keep local list if offline or empty
@@ -521,7 +658,10 @@ export default function KinoScopeStudioPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          fileName: activeVideo.name,
           fileUri: activeVideo.uri,
+          displayName: activeVideo.displayName,
+          sizeBytes: activeVideo.sizeBytes,
           mimeType: activeVideo.mimeType,
           prompt,
           scope,
@@ -536,6 +676,13 @@ export default function KinoScopeStudioPage() {
       if (!res.ok) {
         throw new Error(
           data.error || 'Error al analizar el vídeo con gemini-4-argon.'
+        );
+      }
+
+      if (data.refreshedFile) {
+        applyRefreshedGeminiFile(activeVideo.id, data.refreshedFile);
+        setStatusNotice(
+          `El vídeo "${activeVideo.displayName}" se renovó automáticamente en Gemini File API desde la bóveda permanente de la aplicación.`
         );
       }
 
@@ -610,7 +757,10 @@ export default function KinoScopeStudioPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          fileName: activeVideo.name,
           fileUri: activeVideo.uri,
+          displayName: activeVideo.displayName,
+          sizeBytes: activeVideo.sizeBytes,
           mimeType: activeVideo.mimeType,
           fps,
           thinkingLevel,
@@ -619,6 +769,9 @@ export default function KinoScopeStudioPage() {
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.error || 'Error al autodesglosar escenas.');
+      }
+      if (data.refreshedFile) {
+        applyRefreshedGeminiFile(activeVideo.id, data.refreshedFile);
       }
       if (Array.isArray(data.scenes) && data.scenes.length > 0) {
         const detectedScenes: VideoSceneItem[] = data.scenes;
@@ -661,13 +814,18 @@ export default function KinoScopeStudioPage() {
             method: 'DELETE',
           }
         );
-        await removeCachedVideoFromBrowser(video.name);
+        await removeCachedVideoFromBrowser(
+          video.name,
+          video.displayName,
+          video.sizeBytes
+        );
       }
     } catch {
       // Ignore remote deletion error and remove locally
     }
     const remaining = videos.filter((v) => v.id !== video.id);
     setVideos(remaining);
+    saveVideosToLocalStorage(remaining);
     if (activeVideoId === video.id) {
       setActiveVideoId(remaining[0]?.id || null);
       setCurrentTimeSec(0);
@@ -938,6 +1096,17 @@ export default function KinoScopeStudioPage() {
                               >
                                 {vid.state}
                               </span>
+                              {(vid.isPermanentVault || vid.hasServerCache || Boolean(vid.localObjectUrl)) && (
+                                <>
+                                  <span aria-hidden="true">·</span>
+                                  <span
+                                    title="Guardado permanentemente en la aplicación (auto-renueva File API tras 48h)"
+                                    className="whitespace-nowrap text-cyan-400"
+                                  >
+                                    PERMANENTE
+                                  </span>
+                                </>
+                              )}
                             </div>
                           </button>
 

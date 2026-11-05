@@ -3,8 +3,15 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { getGeminiServerClient } from '@/lib/gemini-server';
-import { MAX_FILE_API_BYTES, parseGeminiVideoDuration } from '@/lib/video-utils';
-import { saveVideoToServerVault } from '@/lib/server-video-vault';
+import {
+  buildVideoStreamUrl,
+  MAX_FILE_API_BYTES,
+  parseGeminiVideoDuration,
+} from '@/lib/video-utils';
+import {
+  findVideoInServerVault,
+  saveVideoToServerVault,
+} from '@/lib/server-video-vault';
 
 export const runtime = 'nodejs';
 
@@ -55,12 +62,67 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 2. Finalize chunked upload: sends the assembled /tmp file to Gemini File API via ai.files.upload
+    // 2. Hydrate permanent server vault from browser IndexedDB without forcing a duplicate File API upload if already active
+    if (action === 'hydrate-vault') {
+      const body = await req.json();
+      const uploadId = sanitizeId(body.uploadId || '');
+      const fileName = String(body.fileName || `files/${uploadId}`);
+      const displayName = String(body.displayName || 'video_cinematografico.mp4');
+      const mimeType = String(body.mimeType || 'video/mp4');
+      const uri = body.uri ? String(body.uri) : undefined;
+      const durationSeconds =
+        typeof body.durationSeconds === 'number' && body.durationSeconds > 0
+          ? body.durationSeconds
+          : undefined;
+      const aspectRatio = body.aspectRatio ? String(body.aspectRatio) : undefined;
+
+      const tmpFilePath = path.join(os.tmpdir(), `kinoscope_${uploadId}.part`);
+      let savedInVault = false;
+      try {
+        const stat = await fs.stat(tmpFilePath);
+        await saveVideoToServerVault({
+          sourceFilePath: tmpFilePath,
+          fileName,
+          displayName,
+          uri,
+          mimeType,
+          sizeBytes: stat.size,
+          durationSeconds,
+          aspectRatio,
+        });
+        savedInVault = true;
+
+        return NextResponse.json({
+          ok: true,
+          fileName,
+          hasServerCache: true,
+          isPermanentVault: true,
+          streamUrl: buildVideoStreamUrl({
+            name: fileName,
+            uri,
+            displayName,
+            sizeBytes: stat.size,
+            mimeType,
+          }),
+        });
+      } finally {
+        if (!savedInVault) {
+          await fs.unlink(tmpFilePath).catch(() => {});
+        }
+      }
+    }
+
+    // 3. Finalize chunked upload: sends the assembled file to Gemini File API and stores permanently in .kinoscope_vault
     if (action === 'finalize') {
       const body = await req.json();
       const uploadId = sanitizeId(body.uploadId || '');
       const mimeType = body.mimeType || 'video/mp4';
       const displayName = body.displayName || 'video_cinematografico.mp4';
+      const clientDurationSeconds =
+        typeof body.durationSeconds === 'number' && body.durationSeconds > 0
+          ? body.durationSeconds
+          : undefined;
+      const clientAspectRatio = body.aspectRatio ? String(body.aspectRatio) : undefined;
 
       const tmpFilePath = path.join(os.tmpdir(), `kinoscope_${uploadId}.part`);
       let savedInVault = false;
@@ -72,6 +134,12 @@ export async function POST(req: NextRequest) {
             { status: 413 }
           );
         }
+
+        // Check if an identical video already exists in the permanent vault so we can link its previousFileNames
+        const existingInVault = await findVideoInServerVault({
+          displayName,
+          sizeBytes: stat.size,
+        });
 
         const ai = getGeminiServerClient();
         const uploadedFile = await ai.files.upload({
@@ -87,18 +155,27 @@ export async function POST(req: NextRequest) {
         const finalMimeType = uploadedFile.mimeType || mimeType;
         const finalSizeBytes = Number(uploadedFile.sizeBytes || stat.size);
 
+        const durationSeconds =
+          parseGeminiVideoDuration(
+            uploadedFile.videoMetadata as Record<string, unknown> | undefined
+          ) || clientDurationSeconds;
+
         await saveVideoToServerVault({
           sourceFilePath: tmpFilePath,
           fileName,
           displayName: finalDisplayName,
+          uri: uploadedFile.uri,
           mimeType: finalMimeType,
           sizeBytes: finalSizeBytes,
+          durationSeconds,
+          aspectRatio: clientAspectRatio,
+          createTime: uploadedFile.createTime,
+          expirationTime: uploadedFile.expirationTime,
+          previousFileNames: existingInVault?.meta?.fileName
+            ? [existingInVault.meta.fileName]
+            : undefined,
         });
         savedInVault = true;
-
-        const durationSeconds = parseGeminiVideoDuration(
-          uploadedFile.videoMetadata as Record<string, unknown> | undefined
-        );
 
         return NextResponse.json({
           file: {
@@ -109,9 +186,17 @@ export async function POST(req: NextRequest) {
             sizeBytes: finalSizeBytes,
             state: uploadedFile.state || 'PROCESSING',
             durationSeconds,
+            aspectRatio: clientAspectRatio,
             videoMetadata: uploadedFile.videoMetadata,
             hasServerCache: true,
-            streamUrl: `/api/files/stream?name=${encodeURIComponent(fileName)}&displayName=${encodeURIComponent(finalDisplayName)}&sizeBytes=${finalSizeBytes}&mimeType=${encodeURIComponent(finalMimeType)}`,
+            isPermanentVault: true,
+            streamUrl: buildVideoStreamUrl({
+              name: fileName,
+              uri: uploadedFile.uri,
+              displayName: finalDisplayName,
+              sizeBytes: finalSizeBytes,
+              mimeType: finalMimeType,
+            }),
             createTime: uploadedFile.createTime,
             expirationTime: uploadedFile.expirationTime,
           },
@@ -123,7 +208,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 3. Standard single FormData upload (for small/medium files)
+    // 4. Standard single FormData upload (for small/medium files)
     const formData = await req.formData();
     const fileEntry = formData.get('file');
     if (!fileEntry || !(fileEntry instanceof Blob)) {
@@ -169,18 +254,22 @@ export async function POST(req: NextRequest) {
       const finalMimeType = uploadedFile.mimeType || mimeType;
       const finalSizeBytes = Number(uploadedFile.sizeBytes || fileEntry.size);
 
+      const durationSeconds = parseGeminiVideoDuration(
+        uploadedFile.videoMetadata as Record<string, unknown> | undefined
+      );
+
       await saveVideoToServerVault({
         sourceFilePath: tmpFilePath,
         fileName,
         displayName: finalDisplayName,
+        uri: uploadedFile.uri,
         mimeType: finalMimeType,
         sizeBytes: finalSizeBytes,
+        durationSeconds,
+        createTime: uploadedFile.createTime,
+        expirationTime: uploadedFile.expirationTime,
       });
       savedInVault = true;
-
-      const durationSeconds = parseGeminiVideoDuration(
-        uploadedFile.videoMetadata as Record<string, unknown> | undefined
-      );
 
       return NextResponse.json({
         file: {
@@ -193,7 +282,14 @@ export async function POST(req: NextRequest) {
           durationSeconds,
           videoMetadata: uploadedFile.videoMetadata,
           hasServerCache: true,
-          streamUrl: `/api/files/stream?name=${encodeURIComponent(fileName)}&displayName=${encodeURIComponent(finalDisplayName)}&sizeBytes=${finalSizeBytes}&mimeType=${encodeURIComponent(finalMimeType)}`,
+          isPermanentVault: true,
+          streamUrl: buildVideoStreamUrl({
+            name: fileName,
+            uri: uploadedFile.uri,
+            displayName: finalDisplayName,
+            sizeBytes: finalSizeBytes,
+            mimeType: finalMimeType,
+          }),
           createTime: uploadedFile.createTime,
           expirationTime: uploadedFile.expirationTime,
         },

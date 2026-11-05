@@ -170,6 +170,8 @@ export function FileUploadModal({
           uploadId,
           mimeType: finalMimeType,
           displayName: finalDisplayName,
+          durationSeconds: probedMeta.durationSeconds,
+          aspectRatio: probedMeta.aspectRatio,
         }),
       });
 
@@ -200,9 +202,11 @@ export function FileUploadModal({
       await cacheVideoBlobInBrowser({
         fileName: geminiFile.name || '',
         displayName: finalDisplayName,
+        uri: geminiFile.uri,
         sizeBytes: selectedFile.size,
         mimeType: geminiFile.mimeType || finalMimeType,
         durationSeconds: resolvedDuration,
+        aspectRatio: probedMeta.aspectRatio,
         blob: selectedFile,
       });
 
@@ -218,6 +222,8 @@ export function FileUploadModal({
         localObjectUrl: localUrl,
         streamUrl: geminiFile.streamUrl,
         hasServerCache: true,
+        isPermanentVault: true,
+        expirationTime: geminiFile.expirationTime,
         aspectRatio: probedMeta.aspectRatio || '16:9 / Nativo',
         createdAt: new Date().toISOString(),
       };

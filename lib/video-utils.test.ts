@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 import {
   parseTimecodeToSeconds,
   formatSecondsToTimecode,
@@ -7,6 +10,8 @@ import {
   validateSceneRange,
   validateVideoFile,
   buildVideoPart,
+  buildVideoStreamUrl,
+  resolveVideoPlaybackUrl,
   extractTimestampCitations,
   calculateChunkPlan,
   validateThinkingLevelForArgon,
@@ -14,6 +19,14 @@ import {
   normalizeSceneRange,
   MAX_FILE_API_BYTES,
 } from './video-utils';
+import {
+  saveVideoToServerVault,
+  findVideoInServerVault,
+  listServerVaultVideos,
+  updateServerVaultEntryMeta,
+  removeVideoFromServerVault,
+  toSafeVaultKey,
+} from './server-video-vault';
 
 test('validateThinkingLevelForArgon accepts LOW, MEDIUM, HIGH and rejects MINIMAL', () => {
   assert.deepEqual(validateThinkingLevelForArgon(undefined), {
@@ -169,3 +182,86 @@ test('calculateChunkPlan slices large files into sequential chunks', () => {
   assert.equal(plan[0].start, 0);
   assert.equal(plan[2].end, 20 * 1024 * 1024);
 });
+
+test('resolveVideoPlaybackUrl resolves direct streamUrl even when localObjectUrl is absent', () => {
+  assert.equal(resolveVideoPlaybackUrl(null), undefined);
+
+  const withBlob = resolveVideoPlaybackUrl({
+    localObjectUrl: 'blob:http://localhost:3000/123',
+    streamUrl: '/api/files/stream?name=files%2Fabc',
+    name: 'files/abc',
+    uri: 'https://generativelanguage.googleapis.com/v1beta/files/abc',
+    displayName: 'clip.mp4',
+    sizeBytes: 1024,
+    mimeType: 'video/mp4',
+  });
+  assert.equal(withBlob, 'blob:http://localhost:3000/123');
+
+  const withStreamOnly = resolveVideoPlaybackUrl({
+    localObjectUrl: undefined,
+    streamUrl: undefined,
+    name: 'files/abc123',
+    uri: 'https://generativelanguage.googleapis.com/v1beta/files/abc123',
+    displayName: 'secuencia.mp4',
+    sizeBytes: 4096,
+    mimeType: 'video/mp4',
+  });
+  assert.equal(
+    withStreamOnly,
+    buildVideoStreamUrl({
+      name: 'files/abc123',
+      uri: 'https://generativelanguage.googleapis.com/v1beta/files/abc123',
+      displayName: 'secuencia.mp4',
+      sizeBytes: 4096,
+      mimeType: 'video/mp4',
+    })
+  );
+});
+
+test('server-video-vault persists videos permanently and preserves lookup across File API renewals', async () => {
+  const testFileName = `files/unit_test_${Date.now()}`;
+  const renewedFileName = `files/unit_test_renewed_${Date.now()}`;
+  const tmpSource = path.join(os.tmpdir(), `test_src_${Date.now()}.mp4`);
+  await fs.writeFile(tmpSource, Buffer.from('fake-mp4-binary-payload'));
+
+  try {
+    await saveVideoToServerVault({
+      sourceFilePath: tmpSource,
+      fileName: testFileName,
+      displayName: 'Bobina_Permanente_Test.mp4',
+      uri: `https://generativelanguage.googleapis.com/v1beta/${testFileName}`,
+      mimeType: 'video/mp4',
+      sizeBytes: 23,
+      durationSeconds: 48,
+      aspectRatio: '1920×1080',
+    });
+
+    const foundInitial = await findVideoInServerVault({ fileName: testFileName });
+    assert.ok(foundInitial);
+    assert.equal(foundInitial.meta?.displayName, 'Bobina_Permanente_Test.mp4');
+    assert.equal(foundInitial.meta?.durationSeconds, 48);
+
+    // Simulate 48h Gemini File API renewal updating fileName & uri
+    const safeKey = toSafeVaultKey(testFileName);
+    await updateServerVaultEntryMeta(safeKey, {
+      fileName: renewedFileName,
+      uri: `https://generativelanguage.googleapis.com/v1beta/${renewedFileName}`,
+    });
+
+    // Should be findable by BOTH the new fileName and the previous expired fileName
+    const foundByNew = await findVideoInServerVault({ fileName: renewedFileName });
+    assert.ok(foundByNew);
+    assert.equal(foundByNew.meta?.fileName, renewedFileName);
+
+    const foundByOld = await findVideoInServerVault({ fileName: testFileName });
+    assert.ok(foundByOld);
+    assert.equal(foundByOld.meta?.fileName, renewedFileName);
+
+    const allVaultVideos = await listServerVaultVideos();
+    assert.ok(allVaultVideos.some((v) => v.safeKey === safeKey));
+  } finally {
+    await removeVideoFromServerVault(testFileName);
+    await removeVideoFromServerVault(renewedFileName);
+  }
+});
+
