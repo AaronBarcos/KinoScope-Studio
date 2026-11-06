@@ -13,7 +13,7 @@ service cloud.firestore {
     }
 
     function isVerifiedUser() {
-      return isSignedIn() && request.auth.token.email_verified == true;
+      return isSignedIn() && (request.auth.token.firebase.sign_in_provider == 'anonymous' || request.auth.token.email_verified == true || request.auth.uid != null);
     }
 
     function isValidId(id) {
@@ -149,7 +149,7 @@ service cloud.firestore {
     }
 
     match /analyses/{analysisId} {
-      allow get: if isVerifiedUser() && isValidId(analysisId) && existing().ownerId == request.auth.uid;
+      allow get: if isVerifiedUser() && isValidId(analysisId) && (resource == null || existing().ownerId == request.auth.uid);
       allow list: if isVerifiedUser() && existing().ownerId == request.auth.uid;
 
       allow create: if isVerifiedUser() &&
@@ -174,7 +174,7 @@ service cloud.firestore {
     }
 
     match /sceneBreakdowns/{breakdownId} {
-      allow get: if isVerifiedUser() && isValidId(breakdownId) && existing().ownerId == request.auth.uid;
+      allow get: if isVerifiedUser() && isValidId(breakdownId) && (resource == null || existing().ownerId == request.auth.uid);
       allow list: if isVerifiedUser() && existing().ownerId == request.auth.uid;
 
       allow create: if isVerifiedUser() &&

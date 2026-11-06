@@ -339,6 +339,7 @@ export async function ensureActiveGeminiFile(params: {
   displayName?: string;
   mimeType?: string;
   sizeBytes?: number;
+  forceReupload?: boolean;
 }): Promise<{
   fileName: string;
   fileUri: string;
@@ -363,8 +364,15 @@ export async function ensureActiveGeminiFile(params: {
     params.fileName ||
     extractGeminiNameFromUri(params.fileUri);
 
-  // 1. Check if the current Gemini File API entry is still ACTIVE
-  if (candidateName && !candidateName.startsWith('local-') && !candidateName.startsWith('vault_')) {
+  let remoteCheckFailedWith403Or404 = false;
+
+  // 1. Check if the current Gemini File API entry is still ACTIVE (unless forceReupload is requested after a 403)
+  if (
+    !params.forceReupload &&
+    candidateName &&
+    !candidateName.startsWith('local-') &&
+    !candidateName.startsWith('vault_')
+  ) {
     try {
       const normalizedName = candidateName.startsWith('files/')
         ? candidateName
@@ -402,14 +410,28 @@ export async function ensureActiveGeminiFile(params: {
           refreshed: false,
         };
       }
-    } catch {
-      // File expired (>48h) or not found in Gemini File API — proceed to auto-reupload from permanent vault
+    } catch (checkErr: unknown) {
+      // File expired (>48h), not found (404), or belongs to another project/key (403 PERMISSION_DENIED) — proceed to auto-reupload from permanent vault
+      const msg = checkErr instanceof Error ? checkErr.message : String(checkErr);
+      if (
+        msg.includes('403') ||
+        msg.includes('PERMISSION_DENIED') ||
+        msg.includes('404') ||
+        msg.includes('NOT_FOUND')
+      ) {
+        remoteCheckFailedWith403Or404 = true;
+      }
     }
   }
 
-  // 2. If not active or expired, re-upload automatically from the permanent server vault
+  // 2. If not active, expired, or 403 permission denied, re-upload automatically from the permanent server vault
   if (!vaultMatch) {
-    if (params.fileUri) {
+    if (
+      params.fileUri &&
+      !params.forceReupload &&
+      !remoteCheckFailedWith403Or404 &&
+      !params.fileUri.startsWith('vault://')
+    ) {
       return {
         fileName: candidateName || 'files/unknown',
         fileUri: params.fileUri,
@@ -419,7 +441,7 @@ export async function ensureActiveGeminiFile(params: {
       };
     }
     throw new Error(
-      'El archivo en Gemini File API ha caducado y no se encontró copia en la bóveda permanente del servidor.'
+      'NEEDS_VAULT_HYDRATION: El archivo de vídeo en Gemini File API pertenece a otra clave/proyecto (Error 403) o ha caducado (>48h), y la bóveda del servidor necesita hidratarse desde tu navegador.'
     );
   }
 

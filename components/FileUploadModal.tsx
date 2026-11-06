@@ -5,8 +5,10 @@ import { Upload, X, FileVideo, CheckCircle2, AlertCircle, Loader2 } from 'lucide
 import {
   calculateChunkPlan,
   DEFAULT_CHUNK_SIZE_BYTES,
+  formatAnalysisErrorMessage,
   formatByteSize,
   formatSecondsToTimecode,
+  safeParseJsonResponse,
   UploadedGeminiVideo,
   validateVideoFile,
 } from '@/lib/video-utils';
@@ -84,16 +86,23 @@ export function FileUploadModal({
   }> => {
     for (let attempt = 0; attempt < 40; attempt++) {
       const res = await fetch(`/api/files/status?name=${encodeURIComponent(fileName)}`);
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Error al verificar el estado en la File API.');
+      const parsed = await safeParseJsonResponse<{
+        file?: {
+          state?: 'PROCESSING' | 'ACTIVE' | 'FAILED';
+          uri?: string;
+          durationSeconds?: number;
+        };
+        error?: string;
+      }>(res, 'File API Status');
+      if (!parsed.ok || !parsed.data) {
+        throw new Error(parsed.error || 'Error al verificar el estado en la File API.');
       }
-      const st = data.file?.state as 'PROCESSING' | 'ACTIVE' | 'FAILED';
+      const st = parsed.data.file?.state as 'PROCESSING' | 'ACTIVE' | 'FAILED';
       if (st === 'ACTIVE') {
         return {
           state: 'ACTIVE',
-          uri: data.file?.uri,
-          durationSeconds: data.file?.durationSeconds,
+          uri: parsed.data.file?.uri,
+          durationSeconds: parsed.data.file?.durationSeconds,
         };
       }
       if (st === 'FAILED') {
@@ -148,9 +157,12 @@ export function FileUploadModal({
           }
         );
 
-        const chunkData = await chunkRes.json();
-        if (!chunkRes.ok) {
-          throw new Error(chunkData.error || 'Fallo al transferir bloque de vídeo.');
+        const chunkParsed = await safeParseJsonResponse<{ error?: string }>(
+          chunkRes,
+          'Subida de bloque'
+        );
+        if (!chunkParsed.ok) {
+          throw new Error(chunkParsed.error || 'Fallo al transferir bloque de vídeo.');
         }
 
         setUploadedBytes(chunk.end);
@@ -175,12 +187,23 @@ export function FileUploadModal({
         }),
       });
 
-      const finalizeData = await finalizeRes.json();
-      if (!finalizeRes.ok) {
-        throw new Error(finalizeData.error || 'Error al registrar el archivo en Gemini File API.');
+      const finalizeParsed = await safeParseJsonResponse<{
+        file?: {
+          name?: string;
+          uri?: string;
+          mimeType?: string;
+          state?: 'PROCESSING' | 'ACTIVE' | 'FAILED';
+          durationSeconds?: number;
+          streamUrl?: string;
+          expirationTime?: string;
+        };
+        error?: string;
+      }>(finalizeRes, 'Registro en Gemini File API');
+      if (!finalizeParsed.ok || !finalizeParsed.data?.file) {
+        throw new Error(finalizeParsed.error || 'Error al registrar el archivo en Gemini File API.');
       }
 
-      const geminiFile = finalizeData.file;
+      const geminiFile = finalizeParsed.data.file;
       setUploadStage('processing');
       setProgressPct(90);
 
@@ -212,9 +235,9 @@ export function FileUploadModal({
 
       const newVideo: UploadedGeminiVideo = {
         id: geminiFile.name || `local-${Date.now()}`,
-        name: geminiFile.name,
+        name: geminiFile.name || `local-${Date.now()}`,
         displayName: finalDisplayName,
-        uri: geminiFile.uri,
+        uri: geminiFile.uri || '',
         mimeType: geminiFile.mimeType || finalMimeType,
         sizeBytes: selectedFile.size,
         state: finalState,
@@ -232,9 +255,7 @@ export function FileUploadModal({
       onClose();
     } catch (err: unknown) {
       setUploadStage('error');
-      setValidationError(
-        err instanceof Error ? err.message : 'Error inesperado durante la subida a la File API.'
-      );
+      setValidationError(formatAnalysisErrorMessage(err));
     }
   };
 

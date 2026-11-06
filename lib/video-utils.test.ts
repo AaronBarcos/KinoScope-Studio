@@ -17,6 +17,8 @@ import {
   validateThinkingLevelForArgon,
   parseGeminiVideoDuration,
   normalizeSceneRange,
+  safeParseJsonResponse,
+  formatAnalysisErrorMessage,
   MAX_FILE_API_BYTES,
 } from './video-utils';
 import {
@@ -264,4 +266,56 @@ test('server-video-vault persists videos permanently and preserves lookup across
     await removeVideoFromServerVault(renewedFileName);
   }
 });
+
+test('safeParseJsonResponse handles <!DOCTYPE html> responses and 403 errors gracefully without throwing SyntaxError', async () => {
+  const html403Res = new Response('<!DOCTYPE html><html><body>403 Forbidden</body></html>', {
+    status: 403,
+    headers: { 'Content-Type': 'text/html' },
+  });
+  const parsed403 = await safeParseJsonResponse<{ error?: string }>(
+    html403Res,
+    'Analizar secuencia'
+  );
+  assert.ok(parsed403.error);
+  assert.ok(parsed403.error.includes('403'));
+
+  const html500Res = new Response('<!DOCTYPE html><html><body>Internal Error</body></html>', {
+    status: 500,
+    headers: { 'Content-Type': 'text/html' },
+  });
+  const parsed500 = await safeParseJsonResponse<{ error?: string }>(
+    html500Res,
+    'Analizar secuencia'
+  );
+  assert.ok(parsed500.error);
+  assert.ok(parsed500.error.includes('HTML'));
+
+  const validJsonRes = new Response(JSON.stringify({ answer: 'Plano secuencia en [00:12]' }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+  const parsedOk = await safeParseJsonResponse<{ answer?: string }>(
+    validJsonRes,
+    'Analizar secuencia'
+  );
+  assert.equal(parsedOk.data?.answer, 'Plano secuencia en [00:12]');
+});
+
+test('formatAnalysisErrorMessage translates 403, unauthorized-domain, and <!DOCTYPE errors into clear Spanish guidance', () => {
+  const htmlErr = formatAnalysisErrorMessage(
+    new Error('Unexpected token \'<\', "<!DOCTYPE "... is not valid JSON')
+  );
+  assert.ok(htmlErr.includes('HTML'));
+
+  const domainErr = formatAnalysisErrorMessage(
+    new Error('Firebase: Error (auth/unauthorized-domain).')
+  );
+  assert.ok(domainErr.includes('Dominios autorizados'));
+
+  const filePermErr = formatAnalysisErrorMessage(
+    new Error('403 PERMISSION_DENIED: You do not have permission to access the File files/abc123')
+  );
+  assert.ok(filePermErr.includes('403'));
+});
+
 

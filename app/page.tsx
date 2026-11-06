@@ -15,10 +15,12 @@ import { onAuthStateChanged, User } from 'firebase/auth';
 import {
   AnalysisQueryRecord,
   buildVideoStreamUrl,
+  formatAnalysisErrorMessage,
   formatByteSize,
   formatSecondsToTimecode,
   normalizeSceneRange,
   parseTimecodeToSeconds,
+  safeParseJsonResponse,
   SupportedThinkingLevel,
   toGeminiOffsetString,
   UploadedGeminiVideo,
@@ -140,12 +142,6 @@ export default function KinoScopeStudioPage() {
 
     const uid = currentUser.uid;
 
-    // Backfill any locally saved analyses to Firestore
-    const localItems = loadAnalysesFromLocalStorage();
-    for (const item of localItems) {
-      void saveAnalysisToFirestore(uid, item).catch(() => {});
-    }
-
     const unsubAnalyses = subscribeToUserAnalyses(uid, (remoteRecords) => {
       setAnalyses((prev) => {
         const byId = new Map<string, AnalysisQueryRecord>();
@@ -156,6 +152,7 @@ export default function KinoScopeStudioPage() {
           const cleanId = l.id.replace(/[^a-zA-Z0-9_\-]/g, '_');
           if (!byId.has(l.id) && !byId.has(cleanId)) {
             byId.set(l.id, l);
+            void saveAnalysisToFirestore(uid, l).catch(() => {});
           }
         }
         const merged = Array.from(byId.values()).sort(
@@ -318,9 +315,11 @@ export default function KinoScopeStudioPage() {
         const res = await fetch(
           `/api/files/status?name=${encodeURIComponent(vid.name)}`
         );
-        const data = await res.json();
-        if (res.ok && data.file?.durationSeconds) {
-          resolvedDuration = Number(data.file.durationSeconds);
+        const parsed = await safeParseJsonResponse<{
+          file?: { durationSeconds?: number };
+        }>(res, 'Estado del vídeo');
+        if (parsed.ok && parsed.data?.file?.durationSeconds) {
+          resolvedDuration = Number(parsed.data.file.durationSeconds);
         }
       } catch {
         // Ignore network error
@@ -368,6 +367,16 @@ export default function KinoScopeStudioPage() {
       sizeBytes: targetVideo.sizeBytes || file.size,
       mimeType: file.type || targetVideo.mimeType || 'video/mp4',
       durationSeconds: resolvedDuration,
+      blob: file,
+    });
+
+    void hydrateServerVaultFromBrowserBlob({
+      fileName: targetVideo.name,
+      displayName: targetVideo.displayName,
+      uri: targetVideo.uri,
+      mimeType: file.type || targetVideo.mimeType || 'video/mp4',
+      durationSeconds: resolvedDuration,
+      aspectRatio: meta.aspectRatio || targetVideo.aspectRatio,
       blob: file,
     });
 
@@ -633,6 +642,47 @@ export default function KinoScopeStudioPage() {
     return () => window.clearTimeout(timer);
   }, [handleSyncFileApiVault]);
 
+  const ensureVideoHydratedOnServer = useCallback(
+    async (vid: UploadedGeminiVideo): Promise<boolean> => {
+      try {
+        const cached = await getCachedVideoFromBrowser({
+          fileName: vid.name,
+          displayName: vid.displayName,
+          sizeBytes: vid.sizeBytes,
+        });
+        let blobToHydrate: Blob | null = cached?.blob || null;
+
+        if (
+          !blobToHydrate &&
+          vid.localObjectUrl &&
+          vid.localObjectUrl.startsWith('blob:')
+        ) {
+          const blobRes = await fetch(vid.localObjectUrl).catch(() => null);
+          if (blobRes && blobRes.ok) {
+            blobToHydrate = await blobRes.blob();
+          }
+        }
+
+        if (!blobToHydrate || blobToHydrate.size <= 0) {
+          return false;
+        }
+
+        return await hydrateServerVaultFromBrowserBlob({
+          fileName: vid.name,
+          displayName: vid.displayName,
+          uri: vid.uri,
+          mimeType: vid.mimeType || blobToHydrate.type || 'video/mp4',
+          durationSeconds: vid.durationSeconds || cached?.durationSeconds,
+          aspectRatio: vid.aspectRatio || cached?.aspectRatio,
+          blob: blobToHydrate,
+        });
+      } catch {
+        return false;
+      }
+    },
+    []
+  );
+
   const handleSubmitQuery = async (prompt: string) => {
     if (!activeVideo) {
       setErrorBanner(
@@ -653,8 +703,8 @@ export default function KinoScopeStudioPage() {
         ? toGeminiOffsetString(normalizedRange.endTimecode)
         : undefined;
 
-    try {
-      const res = await fetch('/api/analyze', {
+    const sendAnalyzeRequest = async () =>
+      fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -672,12 +722,55 @@ export default function KinoScopeStudioPage() {
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok) {
+    try {
+      let res = await sendAnalyzeRequest();
+      let parsed = await safeParseJsonResponse<{
+        error?: string;
+        answer?: string;
+        model?: string;
+        thinkingLevel?: SupportedThinkingLevel;
+        citations?: Array<{ label: string; seconds: number }>;
+        refreshedFile?: {
+          name?: string;
+          uri?: string;
+          displayName?: string;
+          mimeType?: string;
+          durationSeconds?: number;
+          expirationTime?: string;
+          streamUrl?: string;
+        };
+      }>(res, 'Analizar secuencia');
+
+      // If 403 Permission Denied / 404 / vault missing on localhost, auto-hydrate server vault from browser cache and retry
+      const firstErr = parsed.error || parsed.data?.error || '';
+      if (
+        !parsed.ok &&
+        (firstErr.includes('403') ||
+          firstErr.includes('PERMISSION_DENIED') ||
+          firstErr.includes('404') ||
+          firstErr.includes('NOT_FOUND') ||
+          firstErr.includes('NEEDS_VAULT_HYDRATION') ||
+          firstErr.includes('hidratar'))
+      ) {
+        const hydrated = await ensureVideoHydratedOnServer(activeVideo);
+        if (hydrated) {
+          res = await sendAnalyzeRequest();
+          parsed = await safeParseJsonResponse(
+            res,
+            'Analizar secuencia (reintento tras hidratar bóveda)'
+          );
+        }
+      }
+
+      if (!parsed.ok || !parsed.data) {
         throw new Error(
-          data.error || 'Error al analizar el vídeo con gemini-4-argon.'
+          parsed.error ||
+            parsed.data?.error ||
+            'Error al analizar el vídeo con gemini-4-argon.'
         );
       }
+
+      const data = parsed.data;
 
       if (data.refreshedFile) {
         applyRefreshedGeminiFile(activeVideo.id, data.refreshedFile);
@@ -700,7 +793,7 @@ export default function KinoScopeStudioPage() {
         fps,
         thinkingLevel: data.thinkingLevel || thinkingLevel,
         prompt,
-        answer: data.answer,
+        answer: data.answer || '',
         model: data.model || 'models/gemini-4-argon',
         createdAt: new Date().toISOString(),
         citations: data.citations || [],
@@ -713,14 +806,14 @@ export default function KinoScopeStudioPage() {
       });
 
       if (currentUser?.uid) {
-        await saveAnalysisToFirestore(currentUser.uid, newRecord);
+        try {
+          await saveAnalysisToFirestore(currentUser.uid, newRecord);
+        } catch {
+          // Non-blocking: local analysis is already saved even if Firestore rules/network fail
+        }
       }
     } catch (err: unknown) {
-      setErrorBanner(
-        err instanceof Error
-          ? err.message
-          : 'Fallo en la consulta a gemini-4-argon.'
-      );
+      setErrorBanner(formatAnalysisErrorMessage(err));
     } finally {
       setIsAnalyzing(false);
     }
@@ -752,8 +845,9 @@ export default function KinoScopeStudioPage() {
 
     setIsGeneratingBreakdown(true);
     setErrorBanner(null);
-    try {
-      const res = await fetch('/api/analyze/breakdown', {
+
+    const sendBreakdownRequest = async () =>
+      fetch('/api/analyze/breakdown', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -766,10 +860,52 @@ export default function KinoScopeStudioPage() {
           thinkingLevel,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Error al autodesglosar escenas.');
+
+    try {
+      let res = await sendBreakdownRequest();
+      let parsed = await safeParseJsonResponse<{
+        error?: string;
+        scenes?: VideoSceneItem[];
+        refreshedFile?: {
+          name?: string;
+          uri?: string;
+          displayName?: string;
+          mimeType?: string;
+          durationSeconds?: number;
+          expirationTime?: string;
+          streamUrl?: string;
+        };
+      }>(res, 'Autodesglosar escenas');
+
+      const firstErr = parsed.error || parsed.data?.error || '';
+      if (
+        !parsed.ok &&
+        (firstErr.includes('403') ||
+          firstErr.includes('PERMISSION_DENIED') ||
+          firstErr.includes('404') ||
+          firstErr.includes('NOT_FOUND') ||
+          firstErr.includes('NEEDS_VAULT_HYDRATION') ||
+          firstErr.includes('hidratar'))
+      ) {
+        const hydrated = await ensureVideoHydratedOnServer(activeVideo);
+        if (hydrated) {
+          res = await sendBreakdownRequest();
+          parsed = await safeParseJsonResponse(
+            res,
+            'Autodesglosar escenas (reintento tras hidratar bóveda)'
+          );
+        }
       }
+
+      if (!parsed.ok || !parsed.data) {
+        throw new Error(
+          parsed.error ||
+            parsed.data?.error ||
+            'Error al autodesglosar escenas.'
+        );
+      }
+
+      const data = parsed.data;
       if (data.refreshedFile) {
         applyRefreshedGeminiFile(activeVideo.id, data.refreshedFile);
       }
@@ -782,12 +918,16 @@ export default function KinoScopeStudioPage() {
         saveBreakdownForVideoLocal(activeVideo.id, detectedScenes);
 
         if (currentUser?.uid) {
-          await saveSceneBreakdownToFirestore(
-            currentUser.uid,
-            activeVideo.id,
-            activeVideo.displayName,
-            detectedScenes
-          );
+          try {
+            await saveSceneBreakdownToFirestore(
+              currentUser.uid,
+              activeVideo.id,
+              activeVideo.displayName,
+              detectedScenes
+            );
+          } catch {
+            // Non-blocking: local breakdown is already saved
+          }
         }
 
         setStatusNotice(
@@ -795,11 +935,7 @@ export default function KinoScopeStudioPage() {
         );
       }
     } catch (err: unknown) {
-      setErrorBanner(
-        err instanceof Error
-          ? err.message
-          : 'No se pudo generar el desglose de escenas.'
-      );
+      setErrorBanner(formatAnalysisErrorMessage(err));
     } finally {
       setIsGeneratingBreakdown(false);
     }

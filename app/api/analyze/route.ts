@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { promises as fs } from 'node:fs';
 import { ThinkingLevel } from '@google/genai';
 import { getGeminiServerClient, GEMINI_VIDEO_MODEL } from '@/lib/gemini-server';
 import {
@@ -8,7 +9,10 @@ import {
   SupportedThinkingLevel,
   validateThinkingLevelForArgon,
 } from '@/lib/video-utils';
-import { ensureActiveGeminiFile } from '@/lib/server-video-vault';
+import {
+  ensureActiveGeminiFile,
+  findVideoInServerVault,
+} from '@/lib/server-video-vault';
 
 export const runtime = 'nodejs';
 
@@ -88,45 +92,118 @@ export async function POST(req: NextRequest) {
     try {
       const ai = getGeminiServerClient();
 
-      // Ensure the Gemini File API resource is ACTIVE (auto-reuploads from permanent vault if >48h expired)
-      const activeFile = await ensureActiveGeminiFile({
-        fileName,
-        fileUri,
-        displayName,
-        mimeType,
-        sizeBytes,
-      });
-
-      const videoPart = buildVideoPart({
-        fileUri: activeFile.fileUri,
-        mimeType: activeFile.mimeType,
-        startOffset: scope === 'scene' ? startOffset : undefined,
-        endOffset: scope === 'scene' ? endOffset : undefined,
-        fps,
-      });
-
+      // Ensure the Gemini File API resource is ACTIVE (auto-reuploads from permanent vault if >48h expired or 403)
       const scopeContext =
         scope === 'scene' && startOffset && endOffset
           ? `Analiza específicamente el fragmento de vídeo comprendido entre startOffset=${startOffset} y endOffset=${endOffset} (muestreado a ${fps} FPS). `
           : `Analiza la totalidad del vídeo cinematográfico (muestreado a ${fps} FPS). `;
 
-      const response = await ai.models.generateContent({
-        model: GEMINI_VIDEO_MODEL,
-        contents: {
-          parts: [
-            videoPart,
-            {
-              text: `${scopeContext}\n\nConsulta del usuario: ${prompt.trim()}`,
-            },
-          ],
-        },
-        config: {
-          systemInstruction: CINEMA_SYSTEM_INSTRUCTION,
-          thinkingConfig: {
-            thinkingLevel: sdkThinkingLevel,
+      const runGenerate = async (targetUri: string, targetMime: string) => {
+        const videoPart = buildVideoPart({
+          fileUri: targetUri,
+          mimeType: targetMime,
+          startOffset: scope === 'scene' ? startOffset : undefined,
+          endOffset: scope === 'scene' ? endOffset : undefined,
+          fps,
+        });
+
+        return ai.models.generateContent({
+          model: GEMINI_VIDEO_MODEL,
+          contents: {
+            parts: [
+              videoPart,
+              {
+                text: `${scopeContext}\n\nConsulta del usuario: ${prompt.trim()}`,
+              },
+            ],
           },
-        },
-      });
+          config: {
+            systemInstruction: CINEMA_SYSTEM_INSTRUCTION,
+            thinkingConfig: {
+              thinkingLevel: sdkThinkingLevel,
+            },
+          },
+        });
+      };
+
+      const runInlineGenerate = async (binPath: string, targetMime: string) => {
+        const bytes = await fs.readFile(binPath);
+        return ai.models.generateContent({
+          model: GEMINI_VIDEO_MODEL,
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  data: bytes.toString('base64'),
+                  mimeType: targetMime,
+                },
+              },
+              {
+                text: `${scopeContext}\n\nConsulta del usuario: ${prompt.trim()}`,
+              },
+            ],
+          },
+          config: {
+            systemInstruction: CINEMA_SYSTEM_INSTRUCTION,
+            thinkingConfig: {
+              thinkingLevel: sdkThinkingLevel,
+            },
+          },
+        });
+      };
+
+      let activeFile: Awaited<ReturnType<typeof ensureActiveGeminiFile>> | null = null;
+      let response;
+      try {
+        activeFile = await ensureActiveGeminiFile({
+          fileName,
+          fileUri,
+          displayName,
+          mimeType,
+          sizeBytes,
+        });
+        response = await runGenerate(activeFile.fileUri, activeFile.mimeType);
+      } catch (firstGenErr: unknown) {
+        const errMsg = firstGenErr instanceof Error ? firstGenErr.message : String(firstGenErr);
+        // If File API URI returned 403 PERMISSION_DENIED or 404 NOT_FOUND (e.g. uploaded under another API key/project),
+        // force a re-upload from the permanent server vault and retry automatically.
+        try {
+          if (
+            errMsg.includes('403') ||
+            errMsg.includes('PERMISSION_DENIED') ||
+            errMsg.includes('404') ||
+            errMsg.includes('NOT_FOUND')
+          ) {
+            activeFile = await ensureActiveGeminiFile({
+              fileName,
+              fileUri,
+              displayName,
+              mimeType,
+              sizeBytes,
+              forceReupload: true,
+            });
+            response = await runGenerate(activeFile.fileUri, activeFile.mimeType);
+          } else {
+            throw firstGenErr;
+          }
+        } catch (retryErr: unknown) {
+          // Fallback: if the video is in .kinoscope_vault and <= 20MB, pass as inlineData
+          const vaultMatch = await findVideoInServerVault({
+            fileName,
+            uri: fileUri,
+            displayName,
+            sizeBytes,
+          });
+          if (vaultMatch && vaultMatch.sizeBytes <= 20 * 1024 * 1024) {
+            response = await runInlineGenerate(
+              vaultMatch.binPath,
+              vaultMatch.mimeType || mimeType
+            );
+          } else {
+            throw retryErr;
+          }
+        }
+      }
 
       const answerText =
         response.text ||
@@ -137,8 +214,8 @@ export async function POST(req: NextRequest) {
         model: GEMINI_VIDEO_MODEL,
         thinkingLevel: resolvedThinkingLevel,
         citations: extractTimestampCitations(answerText),
-        usedFileApi: true,
-        refreshedFile: activeFile.refreshed
+        usedFileApi: Boolean(activeFile),
+        refreshedFile: activeFile?.refreshed
           ? {
               name: activeFile.fileName,
               uri: activeFile.fileUri,

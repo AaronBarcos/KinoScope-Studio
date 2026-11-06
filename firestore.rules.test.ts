@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
 
 /**
  * Security Rules Specification & Dirty Dozen Verification Suite
@@ -20,6 +21,6 @@ describe('Firestore Security Rules — Dirty Dozen Invariants', () => {
       '11_unbounded_array_injection',
       '12_cross_user_query_scraping',
     ];
-    expect(dirtyDozenDenied).toHaveLength(12);
+    assert.equal(dirtyDozenDenied.length, 12);
   });
 });

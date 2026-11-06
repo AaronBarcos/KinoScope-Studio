@@ -534,4 +534,143 @@ export function resolveVideoPlaybackUrl(
   return undefined;
 }
 
+/**
+ * Safely parses a Fetch Response as JSON without throwing `Unexpected token '<', "<!DOCTYPE "... is not valid JSON`
+ * when an API route or proxy returns an HTML error page (e.g., 404, 403, 502, or Firebase Hosting SPA fallback).
+ */
+export async function safeParseJsonResponse<T = Record<string, unknown>>(
+  res: Response,
+  fallbackContext = 'El servidor'
+): Promise<{ ok: boolean; status: number; data: T | null; error?: string }> {
+  const status = res.status;
+  let rawText = '';
+  try {
+    rawText = await res.text();
+  } catch {
+    return {
+      ok: false,
+      status,
+      data: null,
+      error: `${fallbackContext} no pudo leer la respuesta de red (HTTP ${status}).`,
+    };
+  }
+
+  const trimmed = rawText.trim();
+  if (!trimmed) {
+    return {
+      ok: res.ok,
+      status,
+      data: null,
+      error: res.ok ? undefined : `${fallbackContext} devolvió una respuesta vacía (HTTP ${status}).`,
+    };
+  }
+
+  // Detect HTML responses (<!DOCTYPE html>, <html>, etc.) before calling JSON.parse
+  if (trimmed.startsWith('<') || /^<!doctype/i.test(trimmed) || /^<html/i.test(trimmed)) {
+    const titleMatch = trimmed.match(/<title[^>]*>([^<]+)<\/title>/i);
+    const cleanTitle = titleMatch ? titleMatch[1].trim() : '';
+    if (status === 403) {
+      return {
+        ok: false,
+        status,
+        data: null,
+        error:
+          'Permiso denegado (HTTP 403). Verifica la clave GEMINI_API_KEY o las restricciones de dominio/API en Google Cloud / Firebase.',
+      };
+    }
+    if (status === 404) {
+      return {
+        ok: false,
+        status,
+        data: null,
+        error:
+          'Ruta de API no encontrada (HTTP 404). Asegúrate de ejecutar el servidor con soporte de rutas API (`npm run dev` en localhost o Firebase App Hosting).',
+      };
+    }
+    if (status === 413) {
+      return {
+        ok: false,
+        status,
+        data: null,
+        error: 'El bloque enviado supera el tamaño permitido por el servidor (HTTP 413).',
+      };
+    }
+    return {
+      ok: false,
+      status,
+      data: null,
+      error: `${fallbackContext} devolvió HTML en lugar de JSON (HTTP ${status}${cleanTitle ? `: ${cleanTitle}` : ''}).`,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as T;
+    const errField =
+      parsed && typeof parsed === 'object' && 'error' in parsed
+        ? (parsed as Record<string, unknown>).error
+        : undefined;
+    const extractedError =
+      typeof errField === 'string'
+        ? errField
+        : errField && typeof errField === 'object' && 'message' in errField
+          ? String((errField as Record<string, unknown>).message)
+          : undefined;
+
+    return {
+      ok: res.ok,
+      status,
+      data: parsed,
+      error: res.ok ? undefined : extractedError || `Error HTTP ${status}`,
+    };
+  } catch {
+    return {
+      ok: false,
+      status,
+      data: null,
+      error: `Respuesta con formato no válido (HTTP ${status}): ${trimmed.slice(0, 120)}`,
+    };
+  }
+}
+
+/**
+ * Formats raw Gemini / Firebase 403 or domain errors into clear, actionable Spanish messages.
+ */
+export function formatAnalysisErrorMessage(rawError: unknown): string {
+  const msg = rawError instanceof Error ? rawError.message : String(rawError || '');
+
+  if (
+    /<!doctype/i.test(msg) ||
+    msg.includes('Unexpected token') ||
+    msg.includes('is not valid JSON')
+  ) {
+    return 'El servidor devolvió una página HTML (<!DOCTYPE...>) en lugar de una respuesta JSON válida. Asegúrate de que el servidor Next.js esté activo y la clave GEMINI_API_KEY esté configurada.';
+  }
+
+  if (msg.includes('auth/unauthorized-domain') || msg.includes('unauthorized-domain')) {
+    return 'Este dominio (ej. localhost) no está autorizado en Firebase Auth para ventanas emergentes de Google. Tus análisis se guardan localmente sin pérdida de datos; para activar la nube en localhost, añade "localhost" en Firebase Console > Authentication > Settings > Authorized domains (Dominios autorizados).';
+  }
+
+  if (msg.includes('NEEDS_VAULT_HYDRATION')) {
+    return 'El identificador de este vídeo en Gemini File API pertenecía a otra clave/proyecto (Error 403) o ha caducado (>48h), y el archivo binario no está en la caché local de este navegador. Por favor, vuelve a subir el vídeo con «Subir Vídeo» o vincúlalo en el monitor para analizarlo con tu clave actual.';
+  }
+
+  if (
+    msg.includes('403') ||
+    msg.includes('PERMISSION_DENIED') ||
+    msg.includes('permission-denied') ||
+    msg.includes('Missing or insufficient permissions')
+  ) {
+    if (msg.toLowerCase().includes('file') || msg.includes('files/')) {
+      return 'El archivo de vídeo en Gemini File API pertenecía a otra clave o sesión (Error 403 PERMISSION_DENIED). Vuelve a subir o sincronizar el vídeo para analizarlo con tu clave actual.';
+    }
+    if (msg.includes('API_KEY_HTTP_REFERRER_BLOCKED') || msg.includes('referer')) {
+      return 'La clave de API tiene restricciones de dominio HTTP (Error 403). En localhost o servidor backend, usa una GEMINI_API_KEY sin restricción de HTTP Referrer.';
+    }
+    return 'Permiso denegado (Error 403). Verifica que la clave GEMINI_API_KEY tenga permisos para Gemini API / File API o vuelve a subir el vídeo si fue creado con otra cuenta.';
+  }
+
+  return msg || 'Error al procesar el análisis de la secuencia.';
+}
+
+
 

@@ -193,10 +193,7 @@ export async function saveAnalysisToFirestore(
 
   try {
     const ref = doc(db, 'analyses', docId);
-    const existingSnap = await getDoc(ref).catch(() => null);
-    if (!existingSnap || !existingSnap.exists()) {
-      await setDoc(ref, payload);
-    }
+    await setDoc(ref, payload);
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -257,14 +254,22 @@ export async function saveSceneBreakdownToFirestore(
         updatedAt: serverTimestamp(),
       });
     } else {
-      await setDoc(ref, {
-        ownerId: userId.slice(0, MAX_OWNER_ID_LEN),
-        videoId: videoId.slice(0, MAX_VIDEO_ID_LEN),
-        videoTitle: (videoTitle || 'Vídeo').slice(0, MAX_VIDEO_TITLE_LEN),
-        scenes: boundedScenes,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      try {
+        await setDoc(ref, {
+          ownerId: userId.slice(0, MAX_OWNER_ID_LEN),
+          videoId: videoId.slice(0, MAX_VIDEO_ID_LEN),
+          videoTitle: (videoTitle || 'Vídeo').slice(0, MAX_VIDEO_TITLE_LEN),
+          scenes: boundedScenes,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch {
+        await updateDoc(ref, {
+          scenes: boundedScenes,
+          videoTitle: (videoTitle || 'Vídeo').slice(0, MAX_VIDEO_TITLE_LEN),
+          updatedAt: serverTimestamp(),
+        });
+      }
     }
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
