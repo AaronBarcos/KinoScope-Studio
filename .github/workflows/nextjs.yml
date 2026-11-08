@@ -74,7 +74,13 @@ jobs:
       - name: Install dependencies
         run: ${{ steps.detect-package-manager.outputs.manager }} ${{ steps.detect-package-manager.outputs.command }}
       - name: Build with Next.js
-        run: ${{ steps.detect-package-manager.outputs.runner }} next build
+        run: |
+          if [ -d "app/api" ]; then
+            echo "Temporarily moving app/api for static export to GitHub Pages..."
+            mv app/api ./_api_routes_backup
+          fi
+          trap 'if [ -d "./_api_routes_backup" ]; then mv ./_api_routes_backup app/api; fi' EXIT
+          ${{ steps.detect-package-manager.outputs.runner }} next build
         env:
           NEXT_TELEMETRY_DISABLED: 1
       - name: Upload artifact
