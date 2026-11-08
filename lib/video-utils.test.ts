@@ -1,8 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
 import {
   parseTimecodeToSeconds,
   formatSecondsToTimecode,
@@ -10,25 +7,41 @@ import {
   validateSceneRange,
   validateVideoFile,
   buildVideoPart,
-  buildVideoStreamUrl,
-  resolveVideoPlaybackUrl,
   extractTimestampCitations,
   calculateChunkPlan,
   validateThinkingLevelForArgon,
+  validateAnalysisSettings,
   parseGeminiVideoDuration,
   normalizeSceneRange,
   safeParseJsonResponse,
   formatAnalysisErrorMessage,
   MAX_FILE_API_BYTES,
-} from './video-utils';
-import {
-  saveVideoToServerVault,
-  findVideoInServerVault,
-  listServerVaultVideos,
-  updateServerVaultEntryMeta,
-  removeVideoFromServerVault,
-  toSafeVaultKey,
-} from './server-video-vault';
+  isVideoExpired,
+  formatTimeRemaining,
+  formatFriendlyDuration,
+} from './video-utils.ts';
+
+test('analysis settings preserve fractional and maximum FPS and all supported thinking levels', () => {
+  assert.deepEqual(validateAnalysisSettings({}), { valid: true, settings: { fps: 1, thinkingLevel: 'MEDIUM' } });
+  for (const fps of [0.25, 0.5, 1, 5, 24]) {
+    for (const thinkingLevel of ['LOW', 'MEDIUM', 'HIGH']) {
+      assert.deepEqual(validateAnalysisSettings({ fps, thinkingLevel }), {
+        valid: true, settings: { fps, thinkingLevel },
+      });
+      assert.deepEqual(buildVideoPart({ fileUri: 'test-uri', mimeType: 'video/mp4', fps, startOffset: '12s', endOffset: '18s' }).videoMetadata,
+        { startOffset: '12s', endOffset: '18s', fps });
+    }
+  }
+});
+
+test('analysis settings reject malformed client payloads rather than silently using defaults', () => {
+  for (const fps of [0, -1, 24.01, Infinity, NaN, '2', null, {}, []]) {
+    assert.equal(validateAnalysisSettings({ fps }).valid, false, `invalid FPS: ${String(fps)}`);
+  }
+  for (const thinkingLevel of ['MINIMAL', 'unknown', 1, null, {}, []]) {
+    assert.equal(validateAnalysisSettings({ thinkingLevel }).valid, false);
+  }
+});
 
 test('validateThinkingLevelForArgon accepts LOW, MEDIUM, HIGH and rejects MINIMAL', () => {
   assert.deepEqual(validateThinkingLevelForArgon(undefined), {
@@ -185,86 +198,28 @@ test('calculateChunkPlan slices large files into sequential chunks', () => {
   assert.equal(plan[2].end, 20 * 1024 * 1024);
 });
 
-test('resolveVideoPlaybackUrl resolves direct streamUrl even when localObjectUrl is absent', () => {
-  assert.equal(resolveVideoPlaybackUrl(null), undefined);
+test('isVideoExpired and formatTimeRemaining follow the 48h File API expiration', () => {
+  const now = Date.parse('2026-11-08T12:00:00Z');
+  const in47h = new Date(now + 47 * 3_600_000 + 60_000).toISOString();
+  const past = new Date(now - 1000).toISOString();
 
-  const withBlob = resolveVideoPlaybackUrl({
-    localObjectUrl: 'blob:http://localhost:3000/123',
-    streamUrl: '/api/files/stream?name=files%2Fabc',
-    name: 'files/abc',
-    uri: 'https://generativelanguage.googleapis.com/v1beta/files/abc',
-    displayName: 'clip.mp4',
-    sizeBytes: 1024,
-    mimeType: 'video/mp4',
-  });
-  assert.equal(withBlob, 'blob:http://localhost:3000/123');
+  assert.equal(isVideoExpired({ state: 'ACTIVE', expirationTime: in47h }, now), false);
+  assert.equal(isVideoExpired({ state: 'ACTIVE', expirationTime: past }, now), true);
+  assert.equal(isVideoExpired({ state: 'EXPIRED' }, now), true);
+  assert.equal(isVideoExpired({ state: 'ACTIVE' }, now), false);
 
-  const withStreamOnly = resolveVideoPlaybackUrl({
-    localObjectUrl: undefined,
-    streamUrl: undefined,
-    name: 'files/abc123',
-    uri: 'https://generativelanguage.googleapis.com/v1beta/files/abc123',
-    displayName: 'secuencia.mp4',
-    sizeBytes: 4096,
-    mimeType: 'video/mp4',
-  });
-  assert.equal(
-    withStreamOnly,
-    buildVideoStreamUrl({
-      name: 'files/abc123',
-      uri: 'https://generativelanguage.googleapis.com/v1beta/files/abc123',
-      displayName: 'secuencia.mp4',
-      sizeBytes: 4096,
-      mimeType: 'video/mp4',
-    })
-  );
+  assert.equal(formatTimeRemaining(in47h, now), '47 h');
+  assert.equal(formatTimeRemaining(new Date(now + 10 * 60_000).toISOString(), now), '10 min');
+  assert.equal(formatTimeRemaining(past, now), null);
+  assert.equal(formatTimeRemaining(undefined, now), null);
 });
 
-test('server-video-vault persists videos permanently and preserves lookup across File API renewals', async () => {
-  const testFileName = `files/unit_test_${Date.now()}`;
-  const renewedFileName = `files/unit_test_renewed_${Date.now()}`;
-  const tmpSource = path.join(os.tmpdir(), `test_src_${Date.now()}.mp4`);
-  await fs.writeFile(tmpSource, Buffer.from('fake-mp4-binary-payload'));
-
-  try {
-    await saveVideoToServerVault({
-      sourceFilePath: tmpSource,
-      fileName: testFileName,
-      displayName: 'Bobina_Permanente_Test.mp4',
-      uri: `https://generativelanguage.googleapis.com/v1beta/${testFileName}`,
-      mimeType: 'video/mp4',
-      sizeBytes: 23,
-      durationSeconds: 48,
-      aspectRatio: '1920×1080',
-    });
-
-    const foundInitial = await findVideoInServerVault({ fileName: testFileName });
-    assert.ok(foundInitial);
-    assert.equal(foundInitial.meta?.displayName, 'Bobina_Permanente_Test.mp4');
-    assert.equal(foundInitial.meta?.durationSeconds, 48);
-
-    // Simulate 48h Gemini File API renewal updating fileName & uri
-    const safeKey = toSafeVaultKey(testFileName);
-    await updateServerVaultEntryMeta(safeKey, {
-      fileName: renewedFileName,
-      uri: `https://generativelanguage.googleapis.com/v1beta/${renewedFileName}`,
-    });
-
-    // Should be findable by BOTH the new fileName and the previous expired fileName
-    const foundByNew = await findVideoInServerVault({ fileName: renewedFileName });
-    assert.ok(foundByNew);
-    assert.equal(foundByNew.meta?.fileName, renewedFileName);
-
-    const foundByOld = await findVideoInServerVault({ fileName: testFileName });
-    assert.ok(foundByOld);
-    assert.equal(foundByOld.meta?.fileName, renewedFileName);
-
-    const allVaultVideos = await listServerVaultVideos();
-    assert.ok(allVaultVideos.some((v) => v.safeKey === safeKey));
-  } finally {
-    await removeVideoFromServerVault(testFileName);
-    await removeVideoFromServerVault(renewedFileName);
-  }
+test('formatFriendlyDuration renders human readable durations', () => {
+  assert.equal(formatFriendlyDuration(45), '45 s');
+  assert.equal(formatFriendlyDuration(85), '1 min 25 s');
+  assert.equal(formatFriendlyDuration(120), '2 min');
+  assert.equal(formatFriendlyDuration(3720), '1 h 02 min');
+  assert.equal(formatFriendlyDuration(undefined), '');
 });
 
 test('safeParseJsonResponse handles <!DOCTYPE html> responses and 403 errors gracefully without throwing SyntaxError', async () => {
@@ -301,21 +256,19 @@ test('safeParseJsonResponse handles <!DOCTYPE html> responses and 403 errors gra
   assert.equal(parsedOk.data?.answer, 'Plano secuencia en [00:12]');
 });
 
-test('formatAnalysisErrorMessage translates 403, unauthorized-domain, and <!DOCTYPE errors into clear Spanish guidance', () => {
+test('formatAnalysisErrorMessage translates expired, 403 and <!DOCTYPE errors into friendly Spanish guidance', () => {
   const htmlErr = formatAnalysisErrorMessage(
     new Error('Unexpected token \'<\', "<!DOCTYPE "... is not valid JSON')
   );
-  assert.ok(htmlErr.includes('HTML'));
+  assert.ok(htmlErr.includes('servidor'));
 
-  const domainErr = formatAnalysisErrorMessage(
-    new Error('Firebase: Error (auth/unauthorized-domain).')
-  );
-  assert.ok(domainErr.includes('Dominios autorizados'));
+  const expiredErr = formatAnalysisErrorMessage(new Error('VIDEO_EXPIRED: files/abc'));
+  assert.ok(expiredErr.includes('48 horas'));
 
   const filePermErr = formatAnalysisErrorMessage(
     new Error('403 PERMISSION_DENIED: You do not have permission to access the File files/abc123')
   );
-  assert.ok(filePermErr.includes('403'));
+  assert.ok(filePermErr.includes('Vuelve a subirlo'));
 });
 
 

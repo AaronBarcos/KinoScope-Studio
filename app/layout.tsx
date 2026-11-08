@@ -1,52 +1,36 @@
-import type {Metadata} from 'next';
-import {Outfit, Plus_Jakarta_Sans, JetBrains_Mono} from 'next/font/google';
+import type { Metadata } from 'next';
+import { Figtree, Fraunces } from 'next/font/google';
 import './globals.css';
 
-const outfit = Outfit({
+const figtree = Figtree({
   subsets: ['latin'],
-  variable: '--font-outfit',
-  weight: ['500', '600', '700'],
-});
-
-const jakarta = Plus_Jakarta_Sans({
-  subsets: ['latin'],
-  variable: '--font-jakarta',
+  variable: '--font-figtree',
   weight: ['400', '500', '600', '700'],
 });
 
-const jetbrainsMono = JetBrains_Mono({
+const fraunces = Fraunces({
   subsets: ['latin'],
-  variable: '--font-jetbrains-mono',
-  weight: ['400', '500', '600'],
+  variable: '--font-fraunces',
+  weight: ['500', '600', '700'],
 });
 
+const TITLE = 'KinoScope — Entiende cualquier vídeo';
+const DESCRIPTION =
+  'Sube un vídeo y hazle preguntas: la IA te explica escenas, planos, luz y sonido de forma sencilla.';
+
 export const metadata: Metadata = {
-  title: 'KinoScope Studio — Análisis Cinematográfico con Gemini 4 Argon',
-  description:
-    'Plataforma de análisis cinematográfico profundo mediante la File API de Gemini (hasta 2GB) y el modelo gemini-4-argon para consultas sobre películas completas o escenas acotadas por código de tiempo.',
-  openGraph: {
-    title: 'KinoScope Studio — Análisis Cinematográfico con Gemini 4 Argon',
-    description:
-      'Plataforma de análisis cinematográfico profundo mediante la File API de Gemini (hasta 2GB) y el modelo gemini-4-argon para consultas sobre películas completas o escenas acotadas por código de tiempo.',
-    type: 'website',
-  },
-  twitter: {
-    card: 'summary_large_image',
-    title: 'KinoScope Studio — Análisis Cinematográfico con Gemini 4 Argon',
-    description:
-      'Plataforma de análisis cinematográfico profundo mediante la File API de Gemini (hasta 2GB) y el modelo gemini-4-argon para consultas sobre películas completas o escenas acotadas por código de tiempo.',
-  },
+  title: TITLE,
+  description: DESCRIPTION,
+  openGraph: { title: TITLE, description: DESCRIPTION, type: 'website' },
+  twitter: { card: 'summary_large_image', title: TITLE, description: DESCRIPTION },
 };
 
-export default function RootLayout({children}: {children: React.ReactNode}) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html
-      lang="es"
-      className={`${outfit.variable} ${jakarta.variable} ${jetbrainsMono.variable} dark`}
-    >
+    <html lang="es" className={`${figtree.variable} ${fraunces.variable} dark`}>
       <body
         suppressHydrationWarning
-        className="bg-slate-950 text-slate-100 font-sans antialiased selection:bg-amber-500/30 selection:text-amber-200"
+        className="bg-[#0e0f13] text-zinc-100 font-sans antialiased selection:bg-amber-400/30 selection:text-amber-100"
       >
         {children}
       </body>

@@ -38,16 +38,59 @@ export interface UploadedGeminiVideo {
   uri: string;
   mimeType: string;
   sizeBytes: number;
-  state: 'PROCESSING' | 'ACTIVE' | 'FAILED';
+  /** EXPIRED = the Gemini File API deleted it (48 h TTL). Chats are kept locally. */
+  state: 'PROCESSING' | 'ACTIVE' | 'FAILED' | 'EXPIRED';
   durationSeconds?: number;
   aspectRatio?: string;
-  isDemoReel?: boolean;
+  /** Session-only blob URL of the user's local file, used just for on-screen playback. */
   localObjectUrl?: string;
-  streamUrl?: string;
-  hasServerCache?: boolean;
-  isPermanentVault?: boolean;
   expirationTime?: string;
   createdAt: string;
+}
+
+/**
+ * Returns true when the File API copy of the video is gone or past its expiration time.
+ */
+export function isVideoExpired(
+  video: Pick<UploadedGeminiVideo, 'state' | 'expirationTime'>,
+  now: number = Date.now()
+): boolean {
+  if (video.state === 'EXPIRED') return true;
+  if (!video.expirationTime) return false;
+  const exp = new Date(video.expirationTime).getTime();
+  return Number.isFinite(exp) && exp <= now;
+}
+
+/**
+ * Human friendly remaining time until the File API deletes the video (e.g. "47 h", "35 min").
+ */
+export function formatTimeRemaining(
+  expirationTime?: string,
+  now: number = Date.now()
+): string | null {
+  if (!expirationTime) return null;
+  const exp = new Date(expirationTime).getTime();
+  if (!Number.isFinite(exp)) return null;
+  const diffMs = exp - now;
+  if (diffMs <= 0) return null;
+  const hours = Math.floor(diffMs / 3_600_000);
+  if (hours >= 1) return `${hours} h`;
+  const minutes = Math.max(1, Math.floor(diffMs / 60_000));
+  return `${minutes} min`;
+}
+
+/**
+ * Formats seconds as a friendly duration ("1 min 25 s", "45 s", "1 h 02 min").
+ */
+export function formatFriendlyDuration(totalSeconds?: number): string {
+  if (!totalSeconds || !Number.isFinite(totalSeconds) || totalSeconds <= 0) return '';
+  const s = Math.round(totalSeconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h} h ${String(m).padStart(2, '0')} min`;
+  if (m > 0) return sec > 0 ? `${m} min ${sec} s` : `${m} min`;
+  return `${sec} s`;
 }
 
 export type SupportedThinkingLevel = 'LOW' | 'MEDIUM' | 'HIGH';
@@ -60,21 +103,21 @@ export const THINKING_LEVEL_OPTIONS: Array<{
 }> = [
   {
     value: 'LOW',
-    label: 'LOW · Rápido',
-    shortLabel: 'LOW',
-    description: 'Minimiza la latencia y el coste para consultas directas de planos.',
+    label: 'Rápido',
+    shortLabel: 'Rápido',
+    description: 'Menos razonamiento para preguntas directas.',
   },
   {
     value: 'MEDIUM',
-    label: 'MEDIUM · Medio',
-    shortLabel: 'MEDIUM',
-    description: 'Nivel por defecto en gemini-4-argon: equilibra profundidad y velocidad.',
+    label: 'Equilibrado',
+    shortLabel: 'Medio',
+    description: 'Equilibra profundidad y tiempo de respuesta.',
   },
   {
     value: 'HIGH',
-    label: 'HIGH · Alto',
-    shortLabel: 'HIGH',
-    description: 'Maximiza el razonamiento para subtexto narrativo, montaje y raccord complejo.',
+    label: 'Profundo',
+    shortLabel: 'Alto',
+    description: 'Más razonamiento para escenas y preguntas complejas.',
   },
 ];
 
@@ -104,8 +147,36 @@ export function validateThinkingLevelForArgon(input?: string): {
   };
 }
 
+export interface AnalysisSettings {
+  fps: number;
+  thinkingLevel: SupportedThinkingLevel;
+}
+
+export const DEFAULT_ANALYSIS_SETTINGS: AnalysisSettings = {
+  fps: 1,
+  thinkingLevel: 'MEDIUM',
+};
+
+/** Shared by both API routes and persisted browser preferences. */
+export function validateAnalysisSettings(input: {
+  fps?: unknown;
+  thinkingLevel?: unknown;
+}): { valid: true; settings: AnalysisSettings } | { valid: false; error: string } {
+  const fps = input.fps === undefined ? DEFAULT_ANALYSIS_SETTINGS.fps : input.fps;
+  if (typeof fps !== 'number' || !Number.isFinite(fps) || fps <= 0 || fps > 24) {
+    return { valid: false, error: 'Los FPS deben ser un número mayor que 0 y menor o igual que 24.' };
+  }
+  if (input.thinkingLevel !== undefined && typeof input.thinkingLevel !== 'string') {
+    return { valid: false, error: 'Selecciona un nivel de razonamiento: LOW, MEDIUM o HIGH.' };
+  }
+  const thinking = validateThinkingLevelForArgon(input.thinkingLevel as string | undefined);
+  if (!thinking.valid) return { valid: false, error: thinking.error! };
+  return { valid: true, settings: { fps, thinkingLevel: thinking.level } };
+}
+
 export interface AnalysisQueryRecord {
   id: string;
+  chatId: string;
   videoId: string;
   videoTitle: string;
   scope: 'full' | 'scene';
@@ -120,6 +191,18 @@ export interface AnalysisQueryRecord {
   model: string;
   createdAt: string;
   citations: Array<{ label: string; seconds: number }>;
+}
+
+export interface VideoChat {
+  id: string;
+  videoId: string;
+  title: string;
+  createdAt: string;
+}
+
+export interface VideoChatState {
+  chats: VideoChat[];
+  analyses: AnalysisQueryRecord[];
 }
 
 /**
@@ -491,52 +574,58 @@ export function calculateChunkPlan(
 }
 
 /**
- * Builds the deterministic server streaming endpoint URL for a video.
+ * Reads duration and resolution of a local video file in the browser (no upload needed).
  */
-export function buildVideoStreamUrl(params: {
-  name?: string;
-  uri?: string;
-  displayName?: string;
-  sizeBytes?: number;
-  mimeType?: string;
-}): string {
-  const name = params.name || '';
-  const uri = params.uri || '';
-  const displayName = params.displayName || name || 'video.mp4';
-  const sizeBytes = Number.isFinite(params.sizeBytes) ? Number(params.sizeBytes) : 0;
-  const mimeType = params.mimeType || 'video/mp4';
-
-  return `/api/files/stream?name=${encodeURIComponent(name)}&uri=${encodeURIComponent(uri)}&displayName=${encodeURIComponent(displayName)}&sizeBytes=${sizeBytes}&mimeType=${encodeURIComponent(mimeType)}`;
-}
-
-/**
- * Resolves the direct playback URL for the center Program Monitor without requiring
- * the user to manually relink a local file.
- */
-export function resolveVideoPlaybackUrl(
-  video: Pick<
-    UploadedGeminiVideo,
-    'localObjectUrl' | 'streamUrl' | 'name' | 'uri' | 'displayName' | 'sizeBytes' | 'mimeType'
-  > | null
-): string | undefined {
-  if (!video) return undefined;
-  if (video.localObjectUrl) return video.localObjectUrl;
-  if (video.streamUrl) return video.streamUrl;
-  if (video.name || video.displayName || video.uri) {
-    return buildVideoStreamUrl({
-      name: video.name,
-      uri: video.uri,
-      displayName: video.displayName,
-      sizeBytes: video.sizeBytes,
-      mimeType: video.mimeType,
-    });
+export function probeLocalVideoMetadata(
+  fileOrBlob: Blob
+): Promise<{ durationSeconds?: number; aspectRatio?: string }> {
+  if (typeof window === 'undefined') {
+    return Promise.resolve({});
   }
-  return undefined;
+
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(fileOrBlob);
+    const tempVideo = document.createElement('video');
+    tempVideo.preload = 'metadata';
+    tempVideo.muted = true;
+
+    const cleanup = () => {
+      URL.revokeObjectURL(url);
+      tempVideo.removeAttribute('src');
+    };
+
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      resolve({});
+    }, 4000);
+
+    tempVideo.onloadedmetadata = () => {
+      window.clearTimeout(timeout);
+      const dur =
+        Number.isFinite(tempVideo.duration) && tempVideo.duration > 0
+          ? Math.max(1, Math.round(tempVideo.duration))
+          : undefined;
+      let aspectRatio: string | undefined;
+      if (tempVideo.videoWidth > 0 && tempVideo.videoHeight > 0) {
+        aspectRatio = `${tempVideo.videoWidth}×${tempVideo.videoHeight}`;
+      }
+      cleanup();
+      resolve({ durationSeconds: dur, aspectRatio });
+    };
+
+    tempVideo.onerror = () => {
+      window.clearTimeout(timeout);
+      cleanup();
+      resolve({});
+    };
+
+    tempVideo.src = url;
+  });
 }
 
 /**
  * Safely parses a Fetch Response as JSON without throwing `Unexpected token '<', "<!DOCTYPE "... is not valid JSON`
- * when an API route or proxy returns an HTML error page (e.g., 404, 403, 502, or Firebase Hosting SPA fallback).
+ * when an API route or proxy returns an HTML error page (e.g., 404, 403, 502).
  */
 export async function safeParseJsonResponse<T = Record<string, unknown>>(
   res: Response,
@@ -575,7 +664,7 @@ export async function safeParseJsonResponse<T = Record<string, unknown>>(
         status,
         data: null,
         error:
-          'Permiso denegado (HTTP 403). Verifica la clave GEMINI_API_KEY o las restricciones de dominio/API en Google Cloud / Firebase.',
+          'Permiso denegado (HTTP 403). Verifica la clave GEMINI_API_KEY.',
       };
     }
     if (status === 404) {
@@ -584,7 +673,7 @@ export async function safeParseJsonResponse<T = Record<string, unknown>>(
         status,
         data: null,
         error:
-          'Ruta de API no encontrada (HTTP 404). Asegúrate de ejecutar el servidor con soporte de rutas API (`npm run dev` en localhost o Firebase App Hosting).',
+          'Ruta de API no encontrada (HTTP 404). Asegúrate de ejecutar el servidor con `npm run dev`.',
       };
     }
     if (status === 413) {
@@ -633,7 +722,7 @@ export async function safeParseJsonResponse<T = Record<string, unknown>>(
 }
 
 /**
- * Formats raw Gemini / Firebase 403 or domain errors into clear, actionable Spanish messages.
+ * Turns raw server / Gemini errors into short, friendly Spanish messages for non-technical users.
  */
 export function formatAnalysisErrorMessage(rawError: unknown): string {
   const msg = rawError instanceof Error ? rawError.message : String(rawError || '');
@@ -643,34 +732,31 @@ export function formatAnalysisErrorMessage(rawError: unknown): string {
     msg.includes('Unexpected token') ||
     msg.includes('is not valid JSON')
   ) {
-    return 'El servidor devolvió una página HTML (<!DOCTYPE...>) en lugar de una respuesta JSON válida. Asegúrate de que el servidor Next.js esté activo y la clave GEMINI_API_KEY esté configurada.';
+    return 'No se ha podido conectar con el servidor. Comprueba que la aplicación está en marcha y vuelve a intentarlo.';
   }
 
-  if (msg.includes('auth/unauthorized-domain') || msg.includes('unauthorized-domain')) {
-    return 'Este dominio (ej. localhost) no está autorizado en Firebase Auth para ventanas emergentes de Google. Tus análisis se guardan localmente sin pérdida de datos; para activar la nube en localhost, añade "localhost" en Firebase Console > Authentication > Settings > Authorized domains (Dominios autorizados).';
+  if (msg.includes('GEMINI_API_KEY')) {
+    return 'Falta configurar la clave de Gemini (GEMINI_API_KEY) en el servidor.';
   }
 
-  if (msg.includes('NEEDS_VAULT_HYDRATION')) {
-    return 'El identificador de este vídeo en Gemini File API pertenecía a otra clave/proyecto (Error 403) o ha caducado (>48h), y el archivo binario no está en la caché local de este navegador. Por favor, vuelve a subir el vídeo con «Subir Vídeo» o vincúlalo en el monitor para analizarlo con tu clave actual.';
+  if (
+    msg.includes('VIDEO_EXPIRED') ||
+    msg.includes('404') ||
+    msg.includes('NOT_FOUND')
+  ) {
+    return 'Este vídeo ya no está disponible (los vídeos se guardan solo 48 horas). Vuelve a subirlo para seguir preguntando.';
   }
 
   if (
     msg.includes('403') ||
     msg.includes('PERMISSION_DENIED') ||
-    msg.includes('permission-denied') ||
-    msg.includes('Missing or insufficient permissions')
+    msg.includes('permission-denied')
   ) {
     if (msg.toLowerCase().includes('file') || msg.includes('files/')) {
-      return 'El archivo de vídeo en Gemini File API pertenecía a otra clave o sesión (Error 403 PERMISSION_DENIED). Vuelve a subir o sincronizar el vídeo para analizarlo con tu clave actual.';
+      return 'No se puede acceder a este vídeo con la clave actual. Vuelve a subirlo para seguir preguntando.';
     }
-    if (msg.includes('API_KEY_HTTP_REFERRER_BLOCKED') || msg.includes('referer')) {
-      return 'La clave de API tiene restricciones de dominio HTTP (Error 403). En localhost o servidor backend, usa una GEMINI_API_KEY sin restricción de HTTP Referrer.';
-    }
-    return 'Permiso denegado (Error 403). Verifica que la clave GEMINI_API_KEY tenga permisos para Gemini API / File API o vuelve a subir el vídeo si fue creado con otra cuenta.';
+    return 'Permiso denegado. Verifica que la clave GEMINI_API_KEY es correcta.';
   }
 
-  return msg || 'Error al procesar el análisis de la secuencia.';
+  return msg || 'Algo ha salido mal. Vuelve a intentarlo en unos segundos.';
 }
-
-
-

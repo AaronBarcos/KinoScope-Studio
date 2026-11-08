@@ -1,5 +1,4 @@
 import { GoogleGenAI } from '@google/genai';
-import firebaseConfig from '../firebase-applet-config.json';
 
 export const GEMINI_VIDEO_MODEL = 'gemini-4-argon';
 
@@ -8,8 +7,6 @@ export function resolveServerGeminiApiKey(explicitKey?: string): string {
     explicitKey,
     process.env.GEMINI_API_KEY,
     process.env.GOOGLE_API_KEY,
-    process.env.NEXT_PUBLIC_GEMINI_API_KEY,
-    firebaseConfig.apiKey,
   ];
 
   for (const key of candidates) {

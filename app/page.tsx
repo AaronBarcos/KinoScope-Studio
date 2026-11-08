@@ -1,120 +1,106 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Film,
   Upload,
-  RefreshCw,
   Trash2,
-  HardDrive,
   CheckCircle2,
   Clock,
-  FolderKanban,
+  Plus,
 } from 'lucide-react';
-import { onAuthStateChanged, User } from 'firebase/auth';
 import {
   AnalysisQueryRecord,
-  buildVideoStreamUrl,
+  AnalysisSettings,
+  DEFAULT_ANALYSIS_SETTINGS,
   formatAnalysisErrorMessage,
-  formatByteSize,
   formatSecondsToTimecode,
+  formatTimeRemaining,
+  isVideoExpired,
   normalizeSceneRange,
   parseTimecodeToSeconds,
+  probeLocalVideoMetadata,
   safeParseJsonResponse,
-  SupportedThinkingLevel,
   toGeminiOffsetString,
   UploadedGeminiVideo,
+  VideoChat,
   VideoSceneItem,
 } from '@/lib/video-utils';
 import {
-  cacheVideoBlobInBrowser,
-  getCachedVideoFromBrowser,
-  hydrateServerVaultFromBrowserBlob,
-  listAllCachedVideosFromBrowser,
-  probeLocalVideoMetadata,
-  removeCachedVideoFromBrowser,
-} from '@/lib/client-video-cache';
-import {
-  auth,
-  signInWithGooglePopup,
-  signOutFirebaseUser,
-} from '@/lib/firebase';
-import {
-  deleteAnalysisFromFirestore,
-  loadAnalysesFromLocalStorage,
+  getChatAnalyses,
+  loadAnalysisSettings,
+  saveAnalysisSettings,
+  loadChatStateFromLocalStorage,
   loadBreakdownsMapFromLocalStorage,
   loadVideosFromLocalStorage,
-  saveAnalysesToLocalStorage,
-  saveAnalysisToFirestore,
-  saveBreakdownForVideoLocal,
-  saveSceneBreakdownToFirestore,
+  saveChatStateToLocalStorage,
+  saveBreakdownsMapToLocalStorage,
   saveVideosToLocalStorage,
-  subscribeToUserAnalyses,
-  subscribeToUserSceneBreakdowns,
 } from '@/lib/analysis-storage';
 import { CinemaMonitor } from '@/components/CinemaMonitor';
 import { SceneBreakdownTable } from '@/components/SceneBreakdownTable';
 import { AnalysisInspector } from '@/components/AnalysisInspector';
 import { FileUploadModal } from '@/components/FileUploadModal';
+import { AnalysisSettingsPanel } from '@/components/AnalysisSettingsPanel';
+import { VideoTimeline } from '@/components/VideoTimeline';
 
 export default function KinoScopeStudioPage() {
-  const [videos, setVideos] = useState<UploadedGeminiVideo[]>(() =>
-    loadVideosFromLocalStorage()
-  );
+  const [settings, setSettings] = useState<AnalysisSettings>(DEFAULT_ANALYSIS_SETTINGS);
+  const queryInputRef = useRef<HTMLTextAreaElement>(null);
+  const [videos, setVideos] = useState<UploadedGeminiVideo[]>([]);
+  const [isStorageLoaded, setIsStorageLoaded] = useState(false);
   const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
   const [breakdownsByVideo, setBreakdownsByVideo] = useState<
     Record<string, VideoSceneItem[]>
-  >(() => loadBreakdownsMapFromLocalStorage());
-  const [analyses, setAnalyses] = useState<AnalysisQueryRecord[]>(() =>
-    loadAnalysesFromLocalStorage()
-  );
-
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [isAuthReady, setIsAuthReady] = useState<boolean>(false);
+  >({});
+  const [chatState, setChatState] = useState<ReturnType<typeof loadChatStateFromLocalStorage>>({ chats: [], analyses: [] });
+  const { chats, analyses } = chatState;
+  const [activeChatByVideo, setActiveChatByVideo] = useState<Record<string, string>>({});
+  const pendingQueries = useRef(new Set<string>());
+  const [pendingChatIds, setPendingChatIds] = useState<string[]>([]);
+  const [chatErrors, setChatErrors] = useState<Record<string, string | null>>({});
 
   const [currentTimeSec, setCurrentTimeSec] = useState<number>(0);
   const [scope, setScope] = useState<'full' | 'scene'>('full');
   const [startTimecode, setStartTimecode] = useState<string>('00:00');
   const [endTimecode, setEndTimecode] = useState<string>('01:00');
-  const [fps, setFps] = useState<number>(1);
-  const [thinkingLevel, setThinkingLevel] =
-    useState<SupportedThinkingLevel>('MEDIUM');
 
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isGeneratingBreakdown, setIsGeneratingBreakdown] = useState(false);
-  const [isSyncingVault, setIsSyncingVault] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
 
   const activeVideo: UploadedGeminiVideo | null =
     videos.find((v) => v.id === activeVideoId) || videos[0] || null;
 
+  const videoChats = activeVideo ? chats.filter((chat) => chat.videoId === activeVideo.id) : [];
+  const activeChat: VideoChat | null = activeVideo
+    ? videoChats.find((chat) => chat.id === activeChatByVideo[activeVideo.id]) || videoChats[0] || {
+        id: `chat_default_${activeVideo.id}`,
+        videoId: activeVideo.id,
+        title: 'Nuevo chat',
+        createdAt: activeVideo.createdAt,
+      }
+    : null;
+  const activeAnalyses = activeChat ? getChatAnalyses(analyses, activeChat) : [];
+  const isAnalyzing = Boolean(activeChat && pendingChatIds.includes(activeChat.id));
+
+  useEffect(() => {
+    setVideos(loadVideosFromLocalStorage());
+    setBreakdownsByVideo(loadBreakdownsMapFromLocalStorage());
+    setChatState(loadChatStateFromLocalStorage());
+    setIsStorageLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (isStorageLoaded) saveChatStateToLocalStorage(chatState);
+  }, [chatState, isStorageLoaded]);
+
   const scenes: VideoSceneItem[] = activeVideo
     ? breakdownsByVideo[activeVideo.id] ||
       breakdownsByVideo[activeVideo.name] ||
       []
     : [];
-
-  const activeVideoCitations = useMemo(() => {
-    if (!activeVideo) return [];
-    const seen = new Set<number>();
-    const list: Array<{ label: string; seconds: number }> = [];
-    for (const a of analyses) {
-      if (
-        a.videoId === activeVideo.id ||
-        a.videoTitle === activeVideo.displayName
-      ) {
-        for (const cit of a.citations || []) {
-          if (!seen.has(cit.seconds)) {
-            seen.add(cit.seconds);
-            list.push(cit);
-          }
-        }
-      }
-    }
-    return list.sort((a, b) => a.seconds - b.seconds);
-  }, [analyses, activeVideo]);
 
   const activeDurationSec = activeVideo?.durationSeconds || 60;
   const rawStartSec = parseTimecodeToSeconds(startTimecode) ?? 0;
@@ -124,90 +110,94 @@ export default function KinoScopeStudioPage() {
     rawEndSec,
     activeDurationSec
   );
-  const startSec = normalizedRange.startSec;
-  const endSec = normalizedRange.endSec;
 
-  // Listen to Firebase Auth state
   useEffect(() => {
-    const unsubAuth = onAuthStateChanged(auth, (user) => {
-      setCurrentUser(user);
-      setIsAuthReady(true);
-    });
-    return () => unsubAuth();
+    setSettings(loadAnalysisSettings());
   }, []);
 
-  // Subscribe to Firestore analyses & scene breakdowns when authenticated
+  const handleSettingsChange = (next: AnalysisSettings) => {
+    setSettings(next);
+    saveAnalysisSettings(next);
+  };
+
+  // Save videos to localStorage whenever the list changes
   useEffect(() => {
-    if (!isAuthReady || !currentUser?.uid) return;
+    if (isStorageLoaded) saveVideosToLocalStorage(videos);
+  }, [videos, isStorageLoaded]);
 
-    const uid = currentUser.uid;
+  // Sync active videos from the Gemini File API on startup
+  const syncFromFileApi = useCallback(async () => {
+    try {
+      const res = await fetch('/api/files/status');
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        files?: Array<{
+          name?: string;
+          displayName?: string;
+          uri?: string;
+          mimeType?: string;
+          sizeBytes?: number;
+          state?: UploadedGeminiVideo['state'];
+          durationSeconds?: number;
+          createTime?: string;
+          expirationTime?: string;
+        }>;
+      };
+      const remoteFiles = Array.isArray(data?.files) ? data.files : [];
+      const remoteByName = new Map(
+        remoteFiles.filter((f) => f.name).map((f) => [String(f.name), f])
+      );
 
-    const unsubAnalyses = subscribeToUserAnalyses(uid, (remoteRecords) => {
-      setAnalyses((prev) => {
-        const byId = new Map<string, AnalysisQueryRecord>();
-        for (const r of remoteRecords) {
-          byId.set(r.id, r);
-        }
-        for (const l of prev) {
-          const cleanId = l.id.replace(/[^a-zA-Z0-9_\-]/g, '_');
-          if (!byId.has(l.id) && !byId.has(cleanId)) {
-            byId.set(l.id, l);
-            void saveAnalysisToFirestore(uid, l).catch(() => {});
+      setVideos((prev) => {
+        const seen = new Set<string>();
+        const updated: UploadedGeminiVideo[] = [];
+
+        for (const local of prev) {
+          seen.add(local.name);
+          const remote = remoteByName.get(local.name);
+          if (remote) {
+            updated.push({
+              ...local,
+              uri: remote.uri || local.uri,
+              state: remote.state || 'ACTIVE',
+              durationSeconds: local.durationSeconds || remote.durationSeconds,
+              expirationTime: remote.expirationTime || local.expirationTime,
+            });
+          } else {
+            updated.push({
+              ...local,
+              state: 'EXPIRED',
+            });
           }
         }
-        const merged = Array.from(byId.values()).sort(
-          (a, b) =>
-            new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-        );
-        saveAnalysesToLocalStorage(merged);
-        return merged;
+
+        for (const remote of remoteFiles) {
+          const name = String(remote.name || '');
+          if (!name || seen.has(name)) continue;
+          updated.push({
+            id: name,
+            name,
+            displayName: String(remote.displayName || name),
+            uri: String(remote.uri || ''),
+            mimeType: String(remote.mimeType || 'video/mp4'),
+            sizeBytes: Number(remote.sizeBytes || 0),
+            state: remote.state || 'ACTIVE',
+            durationSeconds: remote.durationSeconds,
+            expirationTime: remote.expirationTime,
+            createdAt: String(remote.createTime || new Date().toISOString()),
+          });
+        }
+
+        return updated;
       });
-    });
-
-    const unsubBreakdowns = subscribeToUserSceneBreakdowns(
-      uid,
-      (remoteBreakdowns) => {
-        setBreakdownsByVideo((prev) => {
-          const merged = { ...prev, ...remoteBreakdowns };
-          for (const [vid, scList] of Object.entries(remoteBreakdowns)) {
-            saveBreakdownForVideoLocal(vid, scList);
-          }
-          return merged;
-        });
-      }
-    );
-
-    return () => {
-      unsubAnalyses();
-      unsubBreakdowns();
-    };
-  }, [isAuthReady, currentUser?.uid]);
-
-  const handleSignInGoogle = async () => {
-    try {
-      await signInWithGooglePopup();
-      setStatusNotice(
-        'Sesión iniciada con Google. Tus chats y análisis de IA ahora se sincronizan en Firebase Firestore.'
-      );
-    } catch (err: unknown) {
-      setErrorBanner(
-        err instanceof Error
-          ? err.message
-          : 'No se pudo iniciar sesión con Google.'
-      );
-    }
-  };
-
-  const handleSignOut = async () => {
-    try {
-      await signOutFirebaseUser();
-      setStatusNotice(
-        'Sesión de nube cerrada. Los análisis siguen guardándose localmente en este navegador.'
-      );
     } catch {
-      // Ignore sign out error
+      // Keep local list if offline
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    void syncFromFileApi();
+  }, [syncFromFileApi]);
 
   const handleRangeChange = useCallback(
     (
@@ -215,9 +205,7 @@ export default function KinoScopeStudioPage() {
       newEndSec: number,
       changedHandle?: 'start' | 'end'
     ) => {
-      if (changedHandle) {
-        setScope('scene');
-      }
+      if (changedHandle) setScope('scene');
       const norm = normalizeSceneRange(
         newStartSec,
         newEndSec,
@@ -230,14 +218,6 @@ export default function KinoScopeStudioPage() {
     },
     [activeDurationSec]
   );
-
-  const handleSetStartFromPlayhead = (sec: number) => {
-    handleRangeChange(sec, endSec, 'start');
-  };
-
-  const handleSetEndFromPlayhead = (sec: number) => {
-    handleRangeChange(startSec, Math.max(1, sec), 'end');
-  };
 
   const handleSelectSceneRange = (scene: VideoSceneItem) => {
     setCurrentTimeSec(scene.startSeconds);
@@ -253,29 +233,16 @@ export default function KinoScopeStudioPage() {
       const cleanSec = Math.max(1, Math.round(detectedSeconds));
 
       setVideos((prev) =>
-        prev.map((v) => {
-          if (v.id !== videoId) return v;
-          if (
-            v.durationSeconds === cleanSec &&
-            (!aspectRatio || v.aspectRatio === aspectRatio)
-          ) {
-            return v;
-          }
-          return {
-            ...v,
-            durationSeconds: cleanSec,
-            ...(aspectRatio ? { aspectRatio } : {}),
-          };
-        })
+        prev.map((v) =>
+          v.id === videoId
+            ? {
+                ...v,
+                durationSeconds: cleanSec,
+                ...(aspectRatio ? { aspectRatio } : {}),
+              }
+            : v
+        )
       );
-
-      setStartTimecode((prevStart) => {
-        const s = parseTimecodeToSeconds(prevStart) ?? 0;
-        if (s >= cleanSec) {
-          return '00:00';
-        }
-        return formatSecondsToTimecode(s);
-      });
 
       setEndTimecode((prevEnd) => {
         const e = parseTimecodeToSeconds(prevEnd);
@@ -288,97 +255,18 @@ export default function KinoScopeStudioPage() {
     []
   );
 
-  const handleSelectVideo = async (vid: UploadedGeminiVideo) => {
+  const handleSelectVideo = (vid: UploadedGeminiVideo) => {
     setActiveVideoId(vid.id);
     setCurrentTimeSec(0);
+    setScope('full');
     setErrorBanner(null);
-
-    let resolvedDuration = vid.durationSeconds;
-    let resolvedLocalUrl = vid.localObjectUrl;
-
-    if (!resolvedLocalUrl || !resolvedLocalUrl.startsWith('blob:')) {
-      const cached = await getCachedVideoFromBrowser({
-        fileName: vid.name,
-        displayName: vid.displayName,
-        sizeBytes: vid.sizeBytes,
-      });
-      if (cached) {
-        resolvedLocalUrl = cached.objectUrl;
-        if (!resolvedDuration && cached.durationSeconds) {
-          resolvedDuration = cached.durationSeconds;
-        }
-      }
-    }
-
-    if (!resolvedDuration && vid.name) {
-      try {
-        const res = await fetch(
-          `/api/files/status?name=${encodeURIComponent(vid.name)}`
-        );
-        const parsed = await safeParseJsonResponse<{
-          file?: { durationSeconds?: number };
-        }>(res, 'Estado del vídeo');
-        if (parsed.ok && parsed.data?.file?.durationSeconds) {
-          resolvedDuration = Number(parsed.data.file.durationSeconds);
-        }
-      } catch {
-        // Ignore network error
-      }
-    }
-
-    if (
-      resolvedLocalUrl !== vid.localObjectUrl ||
-      resolvedDuration !== vid.durationSeconds
-    ) {
-      setVideos((prev) =>
-        prev.map((v) =>
-          v.id === vid.id
-            ? {
-                ...v,
-                ...(resolvedLocalUrl
-                  ? { localObjectUrl: resolvedLocalUrl }
-                  : {}),
-                ...(resolvedDuration
-                  ? { durationSeconds: resolvedDuration }
-                  : {}),
-              }
-            : v
-        )
-      );
-    }
-
-    const targetEnd = resolvedDuration || 60;
     setStartTimecode('00:00');
-    setEndTimecode(formatSecondsToTimecode(targetEnd));
+    setEndTimecode(formatSecondsToTimecode(vid.durationSeconds || 60));
   };
 
   const handleAttachLocalVideoFile = async (videoId: string, file: File) => {
-    const targetVideo = videos.find((v) => v.id === videoId);
-    if (!targetVideo) return;
-
     const localUrl = URL.createObjectURL(file);
     const meta = await probeLocalVideoMetadata(file);
-    const resolvedDuration =
-      meta.durationSeconds || targetVideo.durationSeconds;
-
-    await cacheVideoBlobInBrowser({
-      fileName: targetVideo.name,
-      displayName: targetVideo.displayName,
-      sizeBytes: targetVideo.sizeBytes || file.size,
-      mimeType: file.type || targetVideo.mimeType || 'video/mp4',
-      durationSeconds: resolvedDuration,
-      blob: file,
-    });
-
-    void hydrateServerVaultFromBrowserBlob({
-      fileName: targetVideo.name,
-      displayName: targetVideo.displayName,
-      uri: targetVideo.uri,
-      mimeType: file.type || targetVideo.mimeType || 'video/mp4',
-      durationSeconds: resolvedDuration,
-      aspectRatio: meta.aspectRatio || targetVideo.aspectRatio,
-      blob: file,
-    });
 
     setVideos((prev) =>
       prev.map((v) =>
@@ -386,313 +274,40 @@ export default function KinoScopeStudioPage() {
           ? {
               ...v,
               localObjectUrl: localUrl,
-              durationSeconds: resolvedDuration,
+              durationSeconds: meta.durationSeconds || v.durationSeconds,
               aspectRatio: meta.aspectRatio || v.aspectRatio,
             }
           : v
       )
     );
 
-    if (resolvedDuration) {
+    if (meta.durationSeconds) {
       setStartTimecode('00:00');
-      setEndTimecode(formatSecondsToTimecode(resolvedDuration));
+      setEndTimecode(formatSecondsToTimecode(meta.durationSeconds));
     }
-
-    setStatusNotice(
-      `Archivo de vídeo "${file.name}" vinculado correctamente para reproducción en el Monitor de Programa.`
-    );
   };
 
-  // Persist videos catalog to localStorage whenever it changes
-  useEffect(() => {
-    saveVideosToLocalStorage(videos);
-  }, [videos]);
-
-  const applyRefreshedGeminiFile = useCallback(
-    (
-      oldVideoId: string,
-      refreshed: {
-        name?: string;
-        uri?: string;
-        displayName?: string;
-        mimeType?: string;
-        durationSeconds?: number;
-        expirationTime?: string;
-        streamUrl?: string;
-      }
-    ) => {
-      if (!refreshed.uri) return;
-      setVideos((prev) =>
-        prev.map((v) =>
-          v.id === oldVideoId
-            ? {
-                ...v,
-                name: refreshed.name || v.name,
-                uri: refreshed.uri || v.uri,
-                streamUrl: refreshed.streamUrl || v.streamUrl,
-                durationSeconds: refreshed.durationSeconds || v.durationSeconds,
-                expirationTime: refreshed.expirationTime || v.expirationTime,
-                state: 'ACTIVE',
-                hasServerCache: true,
-                isPermanentVault: true,
-              }
-            : v
-        )
-      );
-    },
-    []
-  );
-
-  const handleSyncFileApiVault = useCallback(async (silent = false) => {
-    setIsSyncingVault(true);
-    if (!silent) setStatusNotice(null);
-    try {
-      const browserCachedList = await listAllCachedVideosFromBrowser();
-      const res = await fetch('/api/files/status').catch(() => null);
-      const data = res && res.ok ? await res.json().catch(() => null) : null;
-      const remoteFiles: Array<Record<string, unknown>> =
-        data && Array.isArray(data.files) ? data.files : [];
-
-      const remoteVideos: UploadedGeminiVideo[] = await Promise.all(
-        remoteFiles.map(async (f: Record<string, unknown>) => {
-          const fileName = String(f.name || '');
-          const displayName = String(
-            f.displayName || f.name || 'Vídeo File API'
-          );
-          const sizeBytes = Number(f.sizeBytes || 0);
-          const mimeType = String(f.mimeType || 'video/mp4');
-          const uri = String(f.uri || '');
-          const hasServerCache = Boolean(f.hasServerCache);
-          const isPermanentVault = Boolean(f.isPermanentVault || hasServerCache);
-          const streamUrl =
-            typeof f.streamUrl === 'string' && f.streamUrl
-              ? f.streamUrl
-              : buildVideoStreamUrl({
-                  name: fileName,
-                  uri,
-                  displayName,
-                  sizeBytes,
-                  mimeType,
-                });
-
-          const cachedBrowser = await getCachedVideoFromBrowser({
-            fileName,
-            displayName,
-            sizeBytes,
-          });
-
-          // If the browser has the video blob in IndexedDB, but the server vault didn't have it yet, hydrate the server vault in background
-          if (!hasServerCache && cachedBrowser?.blob) {
-            void hydrateServerVaultFromBrowserBlob({
-              fileName,
-              displayName,
-              uri,
-              mimeType,
-              durationSeconds:
-                typeof f.durationSeconds === 'number'
-                  ? f.durationSeconds
-                  : cachedBrowser.durationSeconds,
-              aspectRatio: cachedBrowser.aspectRatio,
-              blob: cachedBrowser.blob,
-            });
-          }
-
-          const remoteDuration =
-            typeof f.durationSeconds === 'number' && f.durationSeconds > 0
-              ? f.durationSeconds
-              : cachedBrowser?.durationSeconds;
-
-          return {
-            id: fileName || `remote-${Math.random()}`,
-            name: fileName,
-            displayName,
-            uri,
-            mimeType,
-            sizeBytes,
-            state:
-              (f.state as 'PROCESSING' | 'ACTIVE' | 'FAILED') || 'ACTIVE',
-            durationSeconds: remoteDuration,
-            localObjectUrl: cachedBrowser?.objectUrl,
-            streamUrl,
-            hasServerCache: hasServerCache || Boolean(cachedBrowser?.blob),
-            isPermanentVault: isPermanentVault || Boolean(cachedBrowser?.blob),
-            expirationTime: f.expirationTime
-              ? String(f.expirationTime)
-              : undefined,
-            aspectRatio:
-              (typeof f.aspectRatio === 'string' && f.aspectRatio) ||
-              cachedBrowser?.aspectRatio ||
-              '16:9',
-            createdAt: String(f.createTime || new Date().toISOString()),
-          };
-        })
-      );
-
-      // Include any videos permanently saved in the browser's IndexedDB even if they expired >48h ago in Gemini File API
-      for (const bc of browserCachedList) {
-        const alreadyInRemote = remoteVideos.some(
-          (rv) =>
-            (bc.fileName && rv.name === bc.fileName) ||
-            (rv.displayName.toLowerCase() === bc.displayName.toLowerCase() &&
-              Math.abs(rv.sizeBytes - bc.sizeBytes) < 1024)
-        );
-        if (!alreadyInRemote) {
-          const fallbackName =
-            bc.fileName || `files/vault_${bc.displayName.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
-          remoteVideos.push({
-            id: fallbackName,
-            name: fallbackName,
-            displayName: bc.displayName,
-            uri: bc.uri || `vault://${fallbackName}`,
-            mimeType: bc.mimeType || 'video/mp4',
-            sizeBytes: bc.sizeBytes,
-            state: 'ACTIVE',
-            durationSeconds: bc.durationSeconds,
-            localObjectUrl: bc.objectUrl,
-            streamUrl: buildVideoStreamUrl({
-              name: fallbackName,
-              uri: bc.uri,
-              displayName: bc.displayName,
-              sizeBytes: bc.sizeBytes,
-              mimeType: bc.mimeType,
-            }),
-            hasServerCache: true,
-            isPermanentVault: true,
-            aspectRatio: bc.aspectRatio || '16:9',
-            createdAt: new Date(bc.updatedAt).toISOString(),
-          });
-
-          // Ensure server vault also has a copy of this browser-stored video for future File API auto-renewals
-          void hydrateServerVaultFromBrowserBlob({
-            fileName: fallbackName,
-            displayName: bc.displayName,
-            uri: bc.uri,
-            mimeType: bc.mimeType || 'video/mp4',
-            durationSeconds: bc.durationSeconds,
-            aspectRatio: bc.aspectRatio,
-            blob: bc.blob,
-          });
-        }
-      }
-
-      setVideos((prev) => {
-        const byName = new Map(prev.map((v) => [v.name, v]));
-        const merged: UploadedGeminiVideo[] = [];
-
-        for (const rv of remoteVideos) {
-          const existing =
-            byName.get(rv.name) ||
-            Array.from(byName.values()).find(
-              (ev) =>
-                ev.displayName.toLowerCase() === rv.displayName.toLowerCase() &&
-                Math.abs((ev.sizeBytes || 0) - (rv.sizeBytes || 0)) < 1024
-            );
-
-          if (existing) {
-            merged.push({
-              ...rv,
-              id: existing.id || rv.id,
-              localObjectUrl: existing.localObjectUrl || rv.localObjectUrl,
-              durationSeconds:
-                existing.durationSeconds || rv.durationSeconds,
-              aspectRatio: existing.aspectRatio || rv.aspectRatio,
-              isPermanentVault: true,
-              hasServerCache: true,
-            });
-            byName.delete(existing.name);
-          } else {
-            merged.push(rv);
-          }
-        }
-
-        for (const leftover of byName.values()) {
-          merged.push(leftover);
-        }
-        return merged;
-      });
-
-      if (remoteVideos.length > 0) {
-        setActiveVideoId((prevId) => {
-          if (prevId) return prevId;
-          const first = remoteVideos[0];
-          if (first.durationSeconds) {
-            setStartTimecode('00:00');
-            setEndTimecode(formatSecondsToTimecode(first.durationSeconds));
-          }
-          return first.id;
-        });
-      }
-
-      if (!silent) {
-        setStatusNotice(
-          `Bóveda permanente sincronizada (${remoteVideos.length} vídeos guardados y listos para reproducción directa).`
-        );
-      }
-    } catch {
-      // Keep local list if offline or empty
-    } finally {
-      setIsSyncingVault(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      void handleSyncFileApiVault(true);
-    }, 0);
-    return () => window.clearTimeout(timer);
-  }, [handleSyncFileApiVault]);
-
-  const ensureVideoHydratedOnServer = useCallback(
-    async (vid: UploadedGeminiVideo): Promise<boolean> => {
-      try {
-        const cached = await getCachedVideoFromBrowser({
-          fileName: vid.name,
-          displayName: vid.displayName,
-          sizeBytes: vid.sizeBytes,
-        });
-        let blobToHydrate: Blob | null = cached?.blob || null;
-
-        if (
-          !blobToHydrate &&
-          vid.localObjectUrl &&
-          vid.localObjectUrl.startsWith('blob:')
-        ) {
-          const blobRes = await fetch(vid.localObjectUrl).catch(() => null);
-          if (blobRes && blobRes.ok) {
-            blobToHydrate = await blobRes.blob();
-          }
-        }
-
-        if (!blobToHydrate || blobToHydrate.size <= 0) {
-          return false;
-        }
-
-        return await hydrateServerVaultFromBrowserBlob({
-          fileName: vid.name,
-          displayName: vid.displayName,
-          uri: vid.uri,
-          mimeType: vid.mimeType || blobToHydrate.type || 'video/mp4',
-          durationSeconds: vid.durationSeconds || cached?.durationSeconds,
-          aspectRatio: vid.aspectRatio || cached?.aspectRatio,
-          blob: blobToHydrate,
-        });
-      } catch {
-        return false;
-      }
-    },
-    []
-  );
-
   const handleSubmitQuery = async (prompt: string) => {
-    if (!activeVideo) {
-      setErrorBanner(
-        'Debes subir o seleccionar un vídeo antes de realizar una consulta.'
-      );
+    if (!activeVideo || !activeChat) {
+      setErrorBanner('Sube o elige un vídeo antes de hacer una pregunta.');
       return;
     }
 
-    setIsAnalyzing(true);
+    if (pendingQueries.current.has(activeChat.id)) return;
+    pendingQueries.current.add(activeChat.id);
+    setPendingChatIds((prev) => [...prev, activeChat.id]);
+    setChatErrors((prev) => ({ ...prev, [activeChat.id]: null }));
     setErrorBanner(null);
+    setChatState((prev) => {
+      const existing = prev.chats.find((chat) => chat.id === activeChat.id);
+      const titledChat = { ...activeChat, title: prompt.slice(0, 60) };
+      return {
+        ...prev,
+        chats: existing
+          ? prev.chats.map((chat) => chat.id === activeChat.id && chat.title === 'Nuevo chat' ? titledChat : chat)
+          : [titledChat, ...prev.chats],
+      };
+    });
 
     const startOffset =
       scope === 'scene'
@@ -703,84 +318,55 @@ export default function KinoScopeStudioPage() {
         ? toGeminiOffsetString(normalizedRange.endTimecode)
         : undefined;
 
-    const sendAnalyzeRequest = async () =>
-      fetch('/api/analyze', {
+    const priorTurns = getChatAnalyses(analyses, activeChat)
+      .slice(0, 6)
+      .reverse()
+      .map((a) => ({
+        prompt: a.scope === 'scene' ? `[Fragmento ${a.startTimecode}–${a.endTimecode}] ${a.prompt}` : a.prompt,
+        answer: a.answer,
+      }));
+
+    try {
+      const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           fileName: activeVideo.name,
           fileUri: activeVideo.uri,
-          displayName: activeVideo.displayName,
-          sizeBytes: activeVideo.sizeBytes,
-          mimeType: activeVideo.mimeType,
           prompt,
-          scope,
           startOffset,
           endOffset,
-          fps,
-          thinkingLevel,
+          history: priorTurns,
+          ...settings,
         }),
       });
 
-    try {
-      let res = await sendAnalyzeRequest();
-      let parsed = await safeParseJsonResponse<{
+      const parsed = await safeParseJsonResponse<{
         error?: string;
         answer?: string;
         model?: string;
-        thinkingLevel?: SupportedThinkingLevel;
         citations?: Array<{ label: string; seconds: number }>;
-        refreshedFile?: {
-          name?: string;
-          uri?: string;
-          displayName?: string;
-          mimeType?: string;
-          durationSeconds?: number;
-          expirationTime?: string;
-          streamUrl?: string;
-        };
-      }>(res, 'Analizar secuencia');
-
-      // If 403 Permission Denied / 404 / vault missing on localhost, auto-hydrate server vault from browser cache and retry
-      const firstErr = parsed.error || parsed.data?.error || '';
-      if (
-        !parsed.ok &&
-        (firstErr.includes('403') ||
-          firstErr.includes('PERMISSION_DENIED') ||
-          firstErr.includes('404') ||
-          firstErr.includes('NOT_FOUND') ||
-          firstErr.includes('NEEDS_VAULT_HYDRATION') ||
-          firstErr.includes('hidratar'))
-      ) {
-        const hydrated = await ensureVideoHydratedOnServer(activeVideo);
-        if (hydrated) {
-          res = await sendAnalyzeRequest();
-          parsed = await safeParseJsonResponse(
-            res,
-            'Analizar secuencia (reintento tras hidratar bóveda)'
-          );
-        }
-      }
+      }>(res, 'Consulta');
 
       if (!parsed.ok || !parsed.data) {
+        if (res.status === 410) {
+          setVideos((prev) =>
+            prev.map((v) =>
+              v.id === activeVideo.id ? { ...v, state: 'EXPIRED' } : v
+            )
+          );
+        }
         throw new Error(
           parsed.error ||
             parsed.data?.error ||
-            'Error al analizar el vídeo con gemini-4-argon.'
+            'No se ha podido analizar el vídeo.'
         );
       }
 
       const data = parsed.data;
-
-      if (data.refreshedFile) {
-        applyRefreshedGeminiFile(activeVideo.id, data.refreshedFile);
-        setStatusNotice(
-          `El vídeo "${activeVideo.displayName}" se renovó automáticamente en Gemini File API desde la bóveda permanente de la aplicación.`
-        );
-      }
-
       const newRecord: AnalysisQueryRecord = {
-        id: `ans_${Date.now()}`,
+        id: `ans_${crypto.randomUUID()}`,
+        chatId: activeChat.id,
         videoId: activeVideo.id,
         videoTitle: activeVideo.displayName,
         scope,
@@ -790,148 +376,96 @@ export default function KinoScopeStudioPage() {
           scope === 'scene' ? normalizedRange.endTimecode : undefined,
         startOffset,
         endOffset,
-        fps,
-        thinkingLevel: data.thinkingLevel || thinkingLevel,
+        fps: settings.fps,
+        thinkingLevel: settings.thinkingLevel,
         prompt,
         answer: data.answer || '',
-        model: data.model || 'models/gemini-4-argon',
+        model: data.model || 'gemini-4-argon',
         createdAt: new Date().toISOString(),
         citations: data.citations || [],
       };
 
-      setAnalyses((prev) => {
-        const updated = [newRecord, ...prev];
-        saveAnalysesToLocalStorage(updated);
-        return updated;
-      });
-
-      if (currentUser?.uid) {
-        try {
-          await saveAnalysisToFirestore(currentUser.uid, newRecord);
-        } catch {
-          // Non-blocking: local analysis is already saved even if Firestore rules/network fail
-        }
-      }
+      setChatState((prev) => ({ ...prev, analyses: [newRecord, ...prev.analyses] }));
     } catch (err: unknown) {
-      setErrorBanner(formatAnalysisErrorMessage(err));
+      setChatErrors((prev) => ({ ...prev, [activeChat.id]: formatAnalysisErrorMessage(err) }));
     } finally {
-      setIsAnalyzing(false);
+      pendingQueries.current.delete(activeChat.id);
+      setPendingChatIds((prev) => prev.filter((id) => id !== activeChat.id));
     }
   };
 
-  const handleDeleteAnalysis = async (analysisId: string) => {
-    setAnalyses((prev) => {
-      const updated = prev.filter((a) => a.id !== analysisId);
-      saveAnalysesToLocalStorage(updated);
-      return updated;
-    });
+  const handleDeleteAnalysis = (analysisId: string) => {
+    setChatState((prev) => ({ ...prev, analyses: prev.analyses.filter((a) => a.id !== analysisId) }));
+  };
 
-    if (currentUser?.uid) {
-      try {
-        await deleteAnalysisFromFirestore(analysisId);
-      } catch {
-        // Ignore if not present in remote collection
-      }
-    }
+  const handleCreateChat = () => {
+    if (!activeVideo) return;
+    const chat: VideoChat = {
+      id: `chat_${crypto.randomUUID()}`,
+      videoId: activeVideo.id,
+      title: 'Nuevo chat',
+      createdAt: new Date().toISOString(),
+    };
+    setChatState((prev) => ({ ...prev, chats: [chat, ...prev.chats] }));
+    setActiveChatByVideo((prev) => ({ ...prev, [activeVideo.id]: chat.id }));
+    setErrorBanner(null);
+  };
+
+  const handleDeleteChat = () => {
+    if (!activeChat || pendingQueries.current.has(activeChat.id)) return;
+    setChatState((prev) => ({
+      chats: prev.chats.filter((chat) => chat.id !== activeChat.id),
+      analyses: prev.analyses.filter((item) => item.chatId !== activeChat.id),
+    }));
+    setChatErrors((prev) => ({ ...prev, [activeChat.id]: null }));
   };
 
   const handleGenerateBreakdown = async () => {
-    if (!activeVideo) {
-      setErrorBanner(
-        'Debes subir o seleccionar un vídeo antes de generar el desglose de escenas.'
-      );
-      return;
-    }
+    if (!activeVideo) return;
 
     setIsGeneratingBreakdown(true);
     setErrorBanner(null);
 
-    const sendBreakdownRequest = async () =>
-      fetch('/api/analyze/breakdown', {
+    try {
+      const res = await fetch('/api/analyze/breakdown', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           fileName: activeVideo.name,
           fileUri: activeVideo.uri,
-          displayName: activeVideo.displayName,
-          sizeBytes: activeVideo.sizeBytes,
-          mimeType: activeVideo.mimeType,
-          fps,
-          thinkingLevel,
+          ...settings,
         }),
       });
 
-    try {
-      let res = await sendBreakdownRequest();
-      let parsed = await safeParseJsonResponse<{
+      const parsed = await safeParseJsonResponse<{
         error?: string;
         scenes?: VideoSceneItem[];
-        refreshedFile?: {
-          name?: string;
-          uri?: string;
-          displayName?: string;
-          mimeType?: string;
-          durationSeconds?: number;
-          expirationTime?: string;
-          streamUrl?: string;
-        };
-      }>(res, 'Autodesglosar escenas');
-
-      const firstErr = parsed.error || parsed.data?.error || '';
-      if (
-        !parsed.ok &&
-        (firstErr.includes('403') ||
-          firstErr.includes('PERMISSION_DENIED') ||
-          firstErr.includes('404') ||
-          firstErr.includes('NOT_FOUND') ||
-          firstErr.includes('NEEDS_VAULT_HYDRATION') ||
-          firstErr.includes('hidratar'))
-      ) {
-        const hydrated = await ensureVideoHydratedOnServer(activeVideo);
-        if (hydrated) {
-          res = await sendBreakdownRequest();
-          parsed = await safeParseJsonResponse(
-            res,
-            'Autodesglosar escenas (reintento tras hidratar bóveda)'
-          );
-        }
-      }
+      }>(res, 'Escenas');
 
       if (!parsed.ok || !parsed.data) {
+        if (res.status === 410) {
+          setVideos((prev) =>
+            prev.map((v) =>
+              v.id === activeVideo.id ? { ...v, state: 'EXPIRED' } : v
+            )
+          );
+        }
         throw new Error(
           parsed.error ||
             parsed.data?.error ||
-            'Error al autodesglosar escenas.'
+            'No se han podido detectar las escenas.'
         );
       }
 
-      const data = parsed.data;
-      if (data.refreshedFile) {
-        applyRefreshedGeminiFile(activeVideo.id, data.refreshedFile);
-      }
-      if (Array.isArray(data.scenes) && data.scenes.length > 0) {
-        const detectedScenes: VideoSceneItem[] = data.scenes;
-        setBreakdownsByVideo((prev) => ({
-          ...prev,
-          [activeVideo.id]: detectedScenes,
-        }));
-        saveBreakdownForVideoLocal(activeVideo.id, detectedScenes);
-
-        if (currentUser?.uid) {
-          try {
-            await saveSceneBreakdownToFirestore(
-              currentUser.uid,
-              activeVideo.id,
-              activeVideo.displayName,
-              detectedScenes
-            );
-          } catch {
-            // Non-blocking: local breakdown is already saved
-          }
-        }
-
+      if (Array.isArray(parsed.data.scenes) && parsed.data.scenes.length > 0) {
+        const detected = parsed.data.scenes;
+        setBreakdownsByVideo((prev) => {
+          const updated = { ...prev, [activeVideo.id]: detected };
+          saveBreakdownsMapToLocalStorage(updated);
+          return updated;
+        });
         setStatusNotice(
-          `Desglose guardado en Timeline: ${detectedScenes.length} escenas detectadas con gemini-4-argon (Thinking ${thinkingLevel}).`
+          `Se han encontrado ${detected.length} escenas en tu vídeo.`
         );
       }
     } catch (err: unknown) {
@@ -943,21 +477,14 @@ export default function KinoScopeStudioPage() {
 
   const handleDeleteVideo = async (video: UploadedGeminiVideo) => {
     try {
-      if (video.name) {
+      if (video.name && !isVideoExpired(video)) {
         await fetch(
           `/api/files/status?name=${encodeURIComponent(video.name)}`,
-          {
-            method: 'DELETE',
-          }
-        );
-        await removeCachedVideoFromBrowser(
-          video.name,
-          video.displayName,
-          video.sizeBytes
+          { method: 'DELETE' }
         );
       }
     } catch {
-      // Ignore remote deletion error and remove locally
+      // Ignore remote deletion errors
     }
     const remaining = videos.filter((v) => v.id !== video.id);
     setVideos(remaining);
@@ -968,393 +495,193 @@ export default function KinoScopeStudioPage() {
     }
   };
 
-  const handleExportMarkdown = () => {
-    const titleName = activeVideo?.displayName || 'Historial_General';
-    const lines = [
-      `# Informe de Análisis Cinematográfico — KinoScope Studio`,
-      `Película / Bobina: ${activeVideo?.displayName || 'Todas las bobinas'}`,
-      ...(activeVideo ? [`URI File API: ${activeVideo.uri}`] : []),
-      `Modelo: models/gemini-4-argon`,
-      ``,
-      `## Bitácora Guardada de Consultas (${analyses.length})`,
-      ...analyses.map(
-        (a, i) =>
-          `### ${i + 1}. [${a.videoTitle}] ${a.prompt}\n- Ámbito: ${
-            a.scope === 'scene'
-              ? `Escena ${a.startTimecode} – ${a.endTimecode} (${a.startOffset} a ${a.endOffset})`
-              : 'Película Completa'
-          } · ${a.fps} FPS · Thinking: ${a.thinkingLevel || 'MEDIUM'}\n\n${a.answer}\n`
-      ),
-    ];
-
-    const blob = new Blob([lines.join('\n')], {
-      type: 'text/markdown;charset=utf-8',
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `informe_${titleName.replace(/[^a-zA-Z0-9_-]/g, '_')}.md`;
-    a.click();
-    URL.revokeObjectURL(url);
-    setStatusNotice('Informe Markdown exportado correctamente.');
-  };
-
-  const totalUsedBytes = videos.reduce((acc, v) => acc + (v.sizeBytes || 0), 0);
-
   return (
-    <div className="min-h-screen lg:h-screen lg:overflow-hidden flex flex-col bg-[#050609] text-slate-100">
-      {/* Strict 3-Zone Top Bar Contract (Styled as NLE Application Header) */}
-      <header className="flex items-center justify-between gap-6 px-4 py-2 border-b border-slate-800/90 bg-[#0a0c11] shrink-0 z-30">
-        {/* Zone 1: Single text element wordmark */}
-        <a
-          href="#top"
-          className="text-sm font-display font-bold tracking-tight text-white whitespace-nowrap shrink-0"
-        >
-          KinoScope Studio
-        </a>
+    <div className="min-h-screen flex flex-col">
+      {/* Friendly header */}
+      <header className="sticky top-0 z-30 backdrop-blur-md bg-[#0e0f13]/80 border-b border-white/5">
+        <div className="max-w-[1600px] mx-auto px-4 sm:px-6 py-3.5 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-2xl bg-amber-400/15 border border-amber-400/30 flex items-center justify-center">
+              <Film className="w-5 h-5 text-amber-400" />
+            </div>
+            <div>
+              <h1 className="font-display text-lg sm:text-xl font-semibold text-white tracking-tight">
+                KinoScope
+              </h1>
+              <p className="text-xs text-zinc-400 hidden sm:block">
+                Sube un vídeo y conversa con él
+              </p>
+            </div>
+          </div>
 
-        {/* Zone 2: 4 concise single-line text navigation links (NLE Workspace Tabs) */}
-        <nav
-          aria-label="Navegación principal del estudio"
-          className="hidden md:flex items-center gap-1 p-0.5 rounded bg-[#05070a] border border-slate-800/90 text-xs font-medium text-slate-400"
-        >
-          <a
-            href="#monitor-section"
-            className="px-3 py-1 rounded-sm bg-[#141821] text-amber-400 hover:text-white transition-colors whitespace-nowrap shrink-0"
-          >
-            Monitor
-          </a>
-          <a
-            href="#desglose-section"
-            className="px-3 py-1 rounded-sm hover:bg-slate-900 hover:text-white transition-colors whitespace-nowrap shrink-0"
-          >
-            Desglose
-          </a>
-          <a
-            href="#consultas-section"
-            className="px-3 py-1 rounded-sm hover:bg-slate-900 hover:text-white transition-colors whitespace-nowrap shrink-0"
-          >
-            Consultas IA
-          </a>
-          <a
-            href="#vault-section"
-            className="px-3 py-1 rounded-sm hover:bg-slate-900 hover:text-white transition-colors whitespace-nowrap shrink-0"
-          >
-            Archivo File API
-          </a>
-        </nav>
-
-        {/* Zone 3: 1 primary action */}
-        <div className="flex items-center gap-3 shrink-0">
           <button
             type="button"
             onClick={() => setIsUploadModalOpen(true)}
-            className="px-3.5 py-1.5 text-xs font-semibold text-slate-950 bg-amber-500 rounded hover:bg-amber-400 transition-colors whitespace-nowrap shrink-0"
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-amber-400 text-zinc-950 text-xs sm:text-sm font-semibold hover:bg-amber-300 transition-colors shadow-sm"
           >
-            Subir Vídeo (Hasta 2GB)
+            <Upload className="w-4 h-4" />
+            <span>Subir vídeo</span>
           </button>
         </div>
       </header>
 
-      {/* Main NLE Docked Workspace (Premiere Pro / DaVinci Resolve Multi-Panel Layout) */}
-      <main className="flex-1 min-h-0 w-full p-1.5 flex flex-col gap-1.5 lg:overflow-hidden">
+      {/* Main content */}
+      <main className="flex-1 max-w-[1600px] w-full mx-auto px-4 sm:px-6 py-6 space-y-5">
         {statusNotice && (
-          <div className="flex items-center justify-between gap-4 rounded border border-slate-800 bg-[#10131a] px-3 py-1.5 text-xs text-slate-200 shrink-0">
+          <div className="kino-fade-in flex items-center justify-between gap-4 rounded-2xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-2.5 text-xs sm:text-sm text-emerald-100">
             <span className="flex items-center gap-2">
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
               <span>{statusNotice}</span>
             </span>
             <button
               type="button"
               onClick={() => setStatusNotice(null)}
-              className="text-slate-400 hover:text-white text-xs"
+              className="text-emerald-200/70 hover:text-white text-xs"
             >
               Cerrar
             </button>
           </div>
         )}
 
-        {/* 3-Column Docked NLE Grid:
-            - Left (col-span-3 / xl:col-span-2): Media Pool & File Upload
-            - Center (col-span-5 / xl:col-span-7): Program Monitor (Center Top) + Multi-Track Timeline & EDL (Bottom)
-            - Right (col-span-4 / xl:col-span-3): AI Analysis Inspector */}
-        <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 gap-1.5 items-stretch">
-          {/* =================================================================
-              LEFT DOCK: NLE PROJECT MEDIA POOL & FILE API UPLOAD
-             ================================================================= */}
-          <section
-            id="vault-section"
-            aria-label="Archivo de bobinas en Gemini File API"
-            className="lg:col-span-3 xl:col-span-2 lg:h-full min-h-0 flex flex-col gap-1.5"
-          >
-            <div className="flex-1 min-h-0 border border-slate-800/90 bg-[#10131a] rounded-md overflow-hidden flex flex-col shadow-lg">
-              {/* NLE Panel Tab Header */}
-              <div className="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-slate-800/90 bg-[#0a0c11] shrink-0">
-                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 -my-1.5 border-t-2 border-amber-500 bg-[#141821] text-slate-100 font-medium text-[11px] tracking-wide">
-                  <FolderKanban className="w-3 h-3 text-amber-400 shrink-0" />
-                  <span>Proyecto · Medios</span>
-                </span>
+        {/* Video selector pills when the user has videos */}
+        {videos.length > 0 && (
+          <div className="flex items-center gap-2 overflow-x-auto pb-1">
+            {videos.map((vid) => {
+              const isSelected = vid.id === activeVideo?.id;
+              const expired = isVideoExpired(vid);
+              const remaining = formatTimeRemaining(vid.expirationTime);
+              const chatCount = chats.filter((chat) => chat.videoId === vid.id).length;
 
-                <button
-                  type="button"
-                  onClick={() => handleSyncFileApiVault(false)}
-                  disabled={isSyncingVault}
-                  aria-label="Sincronizar archivos con Gemini File API"
-                  title="Sincronizar con Gemini File API"
-                  className="p-1 rounded border border-slate-800 bg-slate-900 text-slate-300 hover:text-white hover:border-slate-700 transition-colors"
+              return (
+                <div
+                  key={vid.id}
+                  className={`group inline-flex items-center gap-2 pl-3.5 pr-2 py-1.5 rounded-full border text-xs transition-colors shrink-0 ${
+                    isSelected
+                      ? 'border-amber-400/60 bg-amber-400/15 text-white'
+                      : 'border-white/10 bg-white/[0.03] text-zinc-300 hover:border-white/20'
+                  }`}
                 >
-                  <RefreshCw
-                    className={`w-3 h-3 ${
-                      isSyncingVault ? 'animate-spin text-amber-400' : ''
-                    }`}
-                  />
-                </button>
-              </div>
-
-              {/* Media Pool Toolbar & Upload Action */}
-              <div className="p-2.5 space-y-2.5 border-b border-slate-800/80 bg-[#0c0f16] shrink-0">
-                <button
-                  type="button"
-                  onClick={() => setIsUploadModalOpen(true)}
-                  className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded border border-amber-500/50 bg-amber-500/15 text-xs font-semibold text-amber-300 hover:bg-amber-500 hover:text-slate-950 transition-colors whitespace-nowrap shrink-0"
-                >
-                  <Upload className="w-3.5 h-3.5 shrink-0" />
-                  <span>Importar / Subir Vídeo</span>
-                </button>
-
-                {/* Storage Quota Meter */}
-                <div className="p-2 rounded border border-slate-800/90 bg-[#07090d] space-y-1">
-                  <div className="flex items-center justify-between text-[10px] font-mono tabular-nums">
-                    <span className="flex items-center gap-1 text-slate-400">
-                      <HardDrive className="w-3 h-3 text-amber-400" />
-                      <span>File API</span>
+                  <button
+                    type="button"
+                    onClick={() => handleSelectVideo(vid)}
+                    className="inline-flex items-center gap-2 text-left"
+                  >
+                    <Film className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span className="font-medium max-w-[180px] truncate">
+                      {vid.displayName}
                     </span>
-                    <span className="text-slate-200">
-                      {formatByteSize(totalUsedBytes)} / 2.00 GB
-                    </span>
-                  </div>
-                  <div className="h-1 w-full rounded-full bg-slate-800 overflow-hidden">
-                    <div
-                      style={{
-                        width: `${Math.min(
-                          100,
-                          Math.max(
-                            0,
-                            (totalUsedBytes / (2 * 1024 * 1024 * 1024)) * 100
-                          )
-                        )}%`,
-                      }}
-                      className="h-full bg-amber-400"
-                    />
-                  </div>
+                    {expired ? (
+                      <span className="text-[11px] text-amber-300">
+                        Caducado
+                      </span>
+                    ) : remaining ? (
+                      <span className="inline-flex items-center gap-1 text-[11px] text-zinc-400">
+                        <Clock className="w-3 h-3" />
+                        {remaining}
+                      </span>
+                    ) : null}
+                    {chatCount > 0 && (
+                      <span className="px-1.5 py-0.5 rounded-full bg-white/10 text-[11px] text-zinc-200">
+                        {chatCount} {chatCount === 1 ? 'chat' : 'chats'}
+                      </span>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleDeleteVideo(vid)}
+                    aria-label={`Quitar ${vid.displayName}`}
+                    title="Eliminar vídeo"
+                    className="p-1 rounded-full text-zinc-400 hover:text-red-400 hover:bg-white/5 transition-colors"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
                 </div>
-              </div>
+              );
+            })}
 
-              {/* Media Bin Reel List (Scrollable) */}
-              <div className="flex-1 min-h-0 overflow-y-auto p-2.5 space-y-1.5">
-                <div className="flex items-center justify-between text-[10px] font-mono uppercase tracking-wider text-slate-500 px-1">
-                  <span>Clips en Secuencia ({videos.length})</span>
-                  <span>Máx 2GB</span>
-                </div>
+            <button
+              type="button"
+              onClick={() => setIsUploadModalOpen(true)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full border border-dashed border-white/15 hover:border-amber-400/50 text-xs text-zinc-300 hover:text-amber-200 transition-colors shrink-0"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Otro vídeo</span>
+            </button>
+          </div>
+        )}
 
-                {videos.length === 0 ? (
-                  <div className="p-4 rounded border border-dashed border-slate-800 bg-[#080a0f] text-center space-y-1.5 my-1">
-                    <Film className="w-5 h-5 text-slate-600 mx-auto" />
-                    <p className="text-xs text-slate-300 font-medium">
-                      Bandeja de medios vacía
-                    </p>
-                    <p className="text-[11px] text-slate-500 leading-snug">
-                      Importa un archivo de hasta 2GB o pulsa sincronizar para
-                      cargar tus vídeos de Gemini File API.
-                    </p>
-                  </div>
-                ) : (
-                  videos.map((vid) => {
-                    const isSelected = vid.id === activeVideo?.id;
-                    const savedCount = analyses.filter(
-                      (a) =>
-                        a.videoId === vid.id ||
-                        a.videoTitle === vid.displayName
-                    ).length;
+        <div>
+          <h2 className="text-sm font-semibold text-zinc-100">Editor de vídeo</h2>
+          <p className="mt-1 text-xs text-zinc-500">Selecciona un fragmento y conversa sobre esa escena.</p>
+        </div>
 
-                    return (
-                      <div
-                        key={vid.id}
-                        className={`p-2 rounded border transition-colors ${
-                          isSelected
-                            ? 'border-amber-500/80 bg-[#171c28] shadow-sm'
-                            : 'border-slate-800/90 bg-[#090b10] hover:border-slate-700'
-                        }`}
-                      >
-                        <div className="flex items-start justify-between gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => handleSelectVideo(vid)}
-                            className="text-left flex-1 min-w-0"
-                          >
-                            <div className="flex items-center gap-1.5 text-xs font-medium text-slate-100 truncate">
-                              <Film className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                              <span className="truncate">
-                                {vid.displayName}
-                              </span>
-                            </div>
-                            <div className="mt-1 flex flex-wrap items-center gap-1 text-[10px] font-mono tabular-nums text-slate-400">
-                              <span className="whitespace-nowrap">
-                                {formatByteSize(vid.sizeBytes)}
-                              </span>
-                              {vid.durationSeconds && (
-                                <>
-                                  <span aria-hidden="true">·</span>
-                                  <span className="whitespace-nowrap text-amber-300">
-                                    {formatSecondsToTimecode(
-                                      vid.durationSeconds
-                                    )}
-                                  </span>
-                                </>
-                              )}
-                              {savedCount > 0 && (
-                                <>
-                                  <span aria-hidden="true">·</span>
-                                  <span className="whitespace-nowrap text-emerald-400">
-                                    {savedCount} IA
-                                  </span>
-                                </>
-                              )}
-                              <span aria-hidden="true">·</span>
-                              <span
-                                className={`whitespace-nowrap ${
-                                  vid.state === 'ACTIVE'
-                                    ? 'text-emerald-400'
-                                    : vid.state === 'PROCESSING'
-                                      ? 'text-amber-400'
-                                      : 'text-red-400'
-                                }`}
-                              >
-                                {vid.state}
-                              </span>
-                              {(vid.isPermanentVault || vid.hasServerCache || Boolean(vid.localObjectUrl)) && (
-                                <>
-                                  <span aria-hidden="true">·</span>
-                                  <span
-                                    title="Guardado permanentemente en la aplicación (auto-renueva File API tras 48h)"
-                                    className="whitespace-nowrap text-cyan-400"
-                                  >
-                                    PERMANENTE
-                                  </span>
-                                </>
-                              )}
-                            </div>
-                          </button>
+        <AnalysisSettingsPanel settings={settings} onChange={handleSettingsChange}
+          disabled={pendingChatIds.length > 0 || isGeneratingBreakdown}
+          sampledDuration={activeVideo ? (scope === 'scene' ? normalizedRange.endSec - normalizedRange.startSec : activeDurationSec) : 0} />
 
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteVideo(vid)}
-                            aria-label={`Eliminar ${vid.displayName}`}
-                            className="p-1 text-slate-500 hover:text-red-400 transition-colors shrink-0"
-                          >
-                            <Trash2 className="w-3 h-3" />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-
-              {/* Compact Technical Footer inside Left NLE Media Dock */}
-              <div className="p-2.5 border-t border-slate-800/90 bg-[#080a0f] space-y-1 text-[10px] text-slate-400 shrink-0">
-                <h3 className="font-display font-semibold text-slate-200 text-[11px] flex items-center gap-1.5">
-                  <Clock className="w-3 h-3 text-amber-400 shrink-0" />
-                  <span>Motor File API + Argon</span>
-                </h3>
-                <p className="leading-snug text-slate-400">
-                  Recorte dinámico en timeline mediante{' '}
-                  <code className="font-mono text-amber-300">startOffset</code>{' '}
-                  /{' '}
-                  <code className="font-mono text-amber-300">endOffset</code>,{' '}
-                  <code className="font-mono text-amber-300">fps</code> y{' '}
-                  <code className="font-mono text-amber-300">
-                    thinkingLevel
-                  </code>
-                  .
-                </p>
-              </div>
-            </div>
-          </section>
-
-          {/* =================================================================
-              CENTER DOCK: PROGRAM MONITOR (TOP) + TIMELINE & EDL (BOTTOM)
-             ================================================================= */}
-          <div
-            id="monitor-section"
-            className="lg:col-span-5 xl:col-span-7 lg:h-full min-h-0 flex flex-col gap-1.5 lg:overflow-y-auto"
-          >
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          <div className="lg:col-span-7 space-y-6">
             <CinemaMonitor
+              key={activeVideo?.id || 'no-video'}
               video={activeVideo}
               scenes={scenes}
               currentTimeSec={currentTimeSec}
               onTimeChange={setCurrentTimeSec}
               scope={scope}
-              onScopeChange={setScope}
-              startSec={startSec}
-              endSec={endSec}
-              onRangeChange={handleRangeChange}
-              onSetStartFromPlayhead={handleSetStartFromPlayhead}
-              onSetEndFromPlayhead={handleSetEndFromPlayhead}
-              onSelectSceneRange={handleSelectSceneRange}
+              startSec={normalizedRange.startSec}
+              endSec={normalizedRange.endSec}
               onDurationDetected={handleDurationDetected}
               onAttachLocalVideoFile={handleAttachLocalVideoFile}
               onOpenUpload={() => setIsUploadModalOpen(true)}
-              citations={activeVideoCitations}
               isGeneratingBreakdown={isGeneratingBreakdown}
               onGenerateBreakdown={handleGenerateBreakdown}
             />
-
-            <SceneBreakdownTable
-              scenes={scenes}
-              isGenerating={isGeneratingBreakdown}
-              onGenerateBreakdown={handleGenerateBreakdown}
-              onSeekToScene={(sec) => setCurrentTimeSec(sec)}
-              onScopeToScene={handleSelectSceneRange}
-              currentTimeSec={currentTimeSec}
-            />
           </div>
 
-          {/* =================================================================
-              RIGHT DOCK: GEMINI 4 ARGON AI ANALYSIS INSPECTOR
-             ================================================================= */}
-          <div className="lg:col-span-4 xl:col-span-3 lg:h-full min-h-0 flex flex-col overflow-hidden">
+          <div className="lg:col-span-5 h-[520px] lg:h-[min(580px,65vh)]">
             <AnalysisInspector
+              key={activeChat?.id || 'no-video'}
               activeVideoId={activeVideo?.id}
               activeVideoTitle={activeVideo?.displayName}
+              isVideoExpired={activeVideo ? isVideoExpired(activeVideo) : false}
               scope={scope}
-              onScopeChange={setScope}
               startTimecode={normalizedRange.startTimecode}
               endTimecode={normalizedRange.endTimecode}
-              onStartTimecodeChange={setStartTimecode}
-              onEndTimecodeChange={setEndTimecode}
-              fps={fps}
-              onFpsChange={setFps}
-              thinkingLevel={thinkingLevel}
-              onThinkingLevelChange={setThinkingLevel}
               maxDurationSec={activeDurationSec}
               isAnalyzing={isAnalyzing}
-              errorBanner={errorBanner}
+              errorBanner={(activeChat && chatErrors[activeChat.id]) || errorBanner}
               onSubmitQuery={handleSubmitQuery}
-              analyses={analyses}
+              analyses={activeAnalyses}
+              chats={videoChats}
+              activeChatId={activeChat?.id}
+              onCreateChat={handleCreateChat}
+              onSelectChat={(chatId) => {
+                if (!activeVideo) return;
+                setActiveChatByVideo((prev) => ({ ...prev, [activeVideo.id]: chatId }));
+                setErrorBanner(null);
+              }}
               onDeleteAnalysis={handleDeleteAnalysis}
+              onDeleteChat={handleDeleteChat}
               onSeekToTimestamp={(sec) => setCurrentTimeSec(sec)}
-              onExportMarkdown={handleExportMarkdown}
-              userEmail={currentUser?.email}
-              isAuthReady={isAuthReady}
-              onSignInGoogle={handleSignInGoogle}
-              onSignOut={handleSignOut}
+              queryInputRef={queryInputRef}
             />
           </div>
         </div>
+        {activeVideo && <VideoTimeline key={activeVideo.id}
+          video={activeVideo} scenes={scenes} currentTimeSec={currentTimeSec} scope={scope}
+          startSec={normalizedRange.startSec} endSec={normalizedRange.endSec}
+          onTimeChange={setCurrentTimeSec} onScopeChange={setScope} onRangeChange={handleRangeChange}
+          onSelectScene={handleSelectSceneRange}
+          onAskSelection={() => {
+            queryInputRef.current?.focus();
+            queryInputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }} />}
+        {scenes.length > 0 && <details className="rounded-2xl border border-white/10 bg-[#15171d]">
+          <summary className="cursor-pointer px-5 py-3 text-xs font-medium text-zinc-300">Desglose de escenas · {scenes.length} escenas detectadas</summary>
+          <SceneBreakdownTable scenes={scenes} onSeekToScene={setCurrentTimeSec} onScopeToScene={handleSelectSceneRange} currentTimeSec={currentTimeSec} />
+        </details>}
       </main>
 
-      {/* Upload Modal */}
       <FileUploadModal
         isOpen={isUploadModalOpen}
         onClose={() => setIsUploadModalOpen(false)}
@@ -1365,11 +692,12 @@ export default function KinoScopeStudioPage() {
           ]);
           setActiveVideoId(newVideo.id);
           setCurrentTimeSec(0);
+          setScope('full');
           const dur = newVideo.durationSeconds || 60;
           setStartTimecode('00:00');
           setEndTimecode(formatSecondsToTimecode(dur));
           setStatusNotice(
-            `Vídeo "${newVideo.displayName}" importado en Bandeja de Medios y Timeline (${newVideo.state}).`
+            `«${newVideo.displayName}» ya está listo. ¡Hazle tu primera pregunta!`
           );
         }}
       />

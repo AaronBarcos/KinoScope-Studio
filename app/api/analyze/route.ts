@@ -1,38 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { promises as fs } from 'node:fs';
-import { ThinkingLevel } from '@google/genai';
+import { ThinkingLevel, type Content } from '@google/genai';
 import { getGeminiServerClient, GEMINI_VIDEO_MODEL } from '@/lib/gemini-server';
-import {
-  buildVideoPart,
-  buildVideoStreamUrl,
-  extractTimestampCitations,
-  SupportedThinkingLevel,
-  validateThinkingLevelForArgon,
-} from '@/lib/video-utils';
-import {
-  ensureActiveGeminiFile,
-  findVideoInServerVault,
-} from '@/lib/server-video-vault';
+import { getActiveGeminiFile } from '@/lib/gemini-files';
+import { buildVideoPart, extractTimestampCitations, validateAnalysisSettings, validateSceneRange } from '@/lib/video-utils';
 
 export const runtime = 'nodejs';
 
-const CINEMA_SYSTEM_INSTRUCTION = `Eres un director de fotografía, montador cinematográfico y analista de guion de primer nivel trabajando en KinoScope Studio.
-Analizas vídeos cinematográficos completos o escenas acotadas mediante códigos de tiempo usando el modelo gemini-4-argon.
+const CINEMA_SYSTEM_INSTRUCTION = `Eres un experto en cine (dirección de fotografía, montaje y guion) que ayuda a cualquier persona a entender un vídeo en KinoScope.
 Reglas de respuesta:
-1. Responde siempre en español con precisión técnica cinematográfica (encuadre, óptica estimada, movimiento de cámara, relación de contraste, temperatura de color, montaje, diseño sonoro y subtexto dramático).
-2. Incluye siempre marcas de tiempo exactas entre corchetes en formato [MM:SS] (por ejemplo [00:18], [01:05], [02:30]) vinculadas a cada hallazgo visual para que el usuario pueda saltar a ese fotograma en el monitor de vídeo.
-3. Estructura tu análisis con subtítulos claros y viñetas concisas.`;
+1. Responde siempre en español, con un tono cercano y claro. Si usas un término técnico, explícalo en pocas palabras.
+2. Incluye marcas de tiempo exactas entre corchetes en formato [MM:SS] (por ejemplo [00:18] o [01:05]) junto a cada cosa que señales, para que el usuario pueda saltar a ese momento del vídeo.
+3. Organiza la respuesta con subtítulos cortos y viñetas breves. Evita párrafos largos.`;
 
-function toSdkThinkingLevel(level: SupportedThinkingLevel): ThinkingLevel {
-  switch (level) {
-    case 'LOW':
-      return ThinkingLevel.LOW;
-    case 'HIGH':
-      return ThinkingLevel.HIGH;
-    case 'MEDIUM':
-    default:
-      return ThinkingLevel.MEDIUM;
-  }
+const MAX_HISTORY_TURNS = 6;
+
+interface HistoryTurn {
+  prompt?: string;
+  answer?: string;
 }
 
 export async function POST(req: NextRequest) {
@@ -41,214 +25,98 @@ export async function POST(req: NextRequest) {
     const {
       fileName,
       fileUri,
-      displayName,
-      sizeBytes,
-      mimeType = 'video/mp4',
       prompt,
-      scope = 'full',
       startOffset,
       endOffset,
-      fps = 1,
-      thinkingLevel: rawThinkingLevel = 'MEDIUM',
+      history = [],
+      fps,
+      thinkingLevel,
     } = body as {
       fileName?: string;
       fileUri?: string;
-      displayName?: string;
-      sizeBytes?: number;
-      mimeType?: string;
       prompt?: string;
-      scope?: 'full' | 'scene';
       startOffset?: string;
       endOffset?: string;
-      fps?: number;
-      thinkingLevel?: string;
+      history?: HistoryTurn[];
+      fps?: unknown;
+      thinkingLevel?: unknown;
     };
 
-    if (!prompt || !prompt.trim()) {
+    if (typeof prompt !== 'string' || !prompt.trim()) {
       return NextResponse.json(
-        { error: 'Debes escribir una consulta cinematográfica para analizar el vídeo.' },
+        { error: 'Escribe una pregunta sobre el vídeo.' },
         { status: 400 }
       );
     }
 
-    if ((!fileUri || !fileUri.trim()) && (!fileName || !fileName.trim())) {
-      return NextResponse.json(
-        { error: 'Se requiere un vídeo registrado en File API o en la bóveda permanente para realizar el análisis.' },
-        { status: 400 }
-      );
+    const settingsCheck = validateAnalysisSettings({ fps, thinkingLevel });
+    if (!settingsCheck.valid) {
+      return NextResponse.json({ error: settingsCheck.error }, { status: 400 });
+    }
+    const settings = settingsCheck.settings;
+    const isFragment = startOffset !== undefined || endOffset !== undefined;
+    if (isFragment && (typeof startOffset !== 'string' || typeof endOffset !== 'string' || !validateSceneRange(startOffset, endOffset).valid)) {
+      return NextResponse.json({ error: 'Selecciona un inicio y un fin válidos para el fragmento.' }, { status: 400 });
+    }
+    const activeFile = await getActiveGeminiFile({ fileName, fileUri });
+    if (isFragment && !validateSceneRange(startOffset!, endOffset!, activeFile.durationSeconds).valid) {
+      return NextResponse.json({ error: 'El fragmento supera la duración del vídeo.' }, { status: 400 });
     }
 
-    const thinkingValidation = validateThinkingLevelForArgon(rawThinkingLevel);
-    if (!thinkingValidation.valid) {
-      return NextResponse.json(
-        { error: thinkingValidation.error },
-        { status: 400 }
-      );
-    }
+    const scopeContext = isFragment
+      ? `Céntrate solo en el fragmento del vídeo entre ${startOffset} y ${endOffset}. Usa marcas de tiempo absolutas respecto al vídeo original, sin reiniciar el contador al inicio del fragmento. `
+      : 'Ten en cuenta el vídeo completo. ';
 
-    const resolvedThinkingLevel = thinkingValidation.level;
-    const sdkThinkingLevel = toSdkThinkingLevel(resolvedThinkingLevel);
+    const previousTurns: Content[] = (Array.isArray(history) ? history : [])
+      .filter((t) => t && typeof t.prompt === 'string' && typeof t.answer === 'string')
+      .slice(-MAX_HISTORY_TURNS)
+      .flatMap((t) => [
+        { role: 'user', parts: [{ text: String(t.prompt) }] },
+        { role: 'model', parts: [{ text: String(t.answer) }] },
+      ]);
 
-    try {
-      const ai = getGeminiServerClient();
-
-      // Ensure the Gemini File API resource is ACTIVE (auto-reuploads from permanent vault if >48h expired or 403)
-      const scopeContext =
-        scope === 'scene' && startOffset && endOffset
-          ? `Analiza específicamente el fragmento de vídeo comprendido entre startOffset=${startOffset} y endOffset=${endOffset} (muestreado a ${fps} FPS). `
-          : `Analiza la totalidad del vídeo cinematográfico (muestreado a ${fps} FPS). `;
-
-      const runGenerate = async (targetUri: string, targetMime: string) => {
-        const videoPart = buildVideoPart({
-          fileUri: targetUri,
-          mimeType: targetMime,
-          startOffset: scope === 'scene' ? startOffset : undefined,
-          endOffset: scope === 'scene' ? endOffset : undefined,
-          fps,
-        });
-
-        return ai.models.generateContent({
-          model: GEMINI_VIDEO_MODEL,
-          contents: {
-            parts: [
-              videoPart,
-              {
-                text: `${scopeContext}\n\nConsulta del usuario: ${prompt.trim()}`,
-              },
-            ],
-          },
-          config: {
-            systemInstruction: CINEMA_SYSTEM_INSTRUCTION,
-            thinkingConfig: {
-              thinkingLevel: sdkThinkingLevel,
-            },
-          },
-        });
-      };
-
-      const runInlineGenerate = async (binPath: string, targetMime: string) => {
-        const bytes = await fs.readFile(binPath);
-        return ai.models.generateContent({
-          model: GEMINI_VIDEO_MODEL,
-          contents: {
-            parts: [
-              {
-                inlineData: {
-                  data: bytes.toString('base64'),
-                  mimeType: targetMime,
-                },
-              },
-              {
-                text: `${scopeContext}\n\nConsulta del usuario: ${prompt.trim()}`,
-              },
-            ],
-          },
-          config: {
-            systemInstruction: CINEMA_SYSTEM_INSTRUCTION,
-            thinkingConfig: {
-              thinkingLevel: sdkThinkingLevel,
-            },
-          },
-        });
-      };
-
-      let activeFile: Awaited<ReturnType<typeof ensureActiveGeminiFile>> | null = null;
-      let response;
-      try {
-        activeFile = await ensureActiveGeminiFile({
-          fileName,
-          fileUri,
-          displayName,
-          mimeType,
-          sizeBytes,
-        });
-        response = await runGenerate(activeFile.fileUri, activeFile.mimeType);
-      } catch (firstGenErr: unknown) {
-        const errMsg = firstGenErr instanceof Error ? firstGenErr.message : String(firstGenErr);
-        // If File API URI returned 403 PERMISSION_DENIED or 404 NOT_FOUND (e.g. uploaded under another API key/project),
-        // force a re-upload from the permanent server vault and retry automatically.
-        try {
-          if (
-            errMsg.includes('403') ||
-            errMsg.includes('PERMISSION_DENIED') ||
-            errMsg.includes('404') ||
-            errMsg.includes('NOT_FOUND')
-          ) {
-            activeFile = await ensureActiveGeminiFile({
-              fileName,
-              fileUri,
-              displayName,
-              mimeType,
-              sizeBytes,
-              forceReupload: true,
-            });
-            response = await runGenerate(activeFile.fileUri, activeFile.mimeType);
-          } else {
-            throw firstGenErr;
-          }
-        } catch (retryErr: unknown) {
-          // Fallback: if the video is in .kinoscope_vault and <= 20MB, pass as inlineData
-          const vaultMatch = await findVideoInServerVault({
-            fileName,
-            uri: fileUri,
-            displayName,
-            sizeBytes,
-          });
-          if (vaultMatch && vaultMatch.sizeBytes <= 20 * 1024 * 1024) {
-            response = await runInlineGenerate(
-              vaultMatch.binPath,
-              vaultMatch.mimeType || mimeType
-            );
-          } else {
-            throw retryErr;
-          }
-        }
-      }
-
-      const answerText =
-        response.text ||
-        'El modelo gemini-4-argon completó la lectura del vídeo sin texto adicional.';
-
-      return NextResponse.json({
-        answer: answerText,
-        model: GEMINI_VIDEO_MODEL,
-        thinkingLevel: resolvedThinkingLevel,
-        citations: extractTimestampCitations(answerText),
-        usedFileApi: Boolean(activeFile),
-        refreshedFile: activeFile?.refreshed
-          ? {
-              name: activeFile.fileName,
-              uri: activeFile.fileUri,
-              displayName: activeFile.displayName,
+    const ai = getGeminiServerClient();
+    const response = await ai.models.generateContent({
+      model: GEMINI_VIDEO_MODEL,
+      contents: [
+        ...previousTurns,
+        {
+          role: 'user',
+          parts: [
+            buildVideoPart({
+              fileUri: activeFile.fileUri,
               mimeType: activeFile.mimeType,
-              durationSeconds: activeFile.durationSeconds,
-              createTime: activeFile.createTime,
-              expirationTime: activeFile.expirationTime,
-              streamUrl: buildVideoStreamUrl({
-                name: activeFile.fileName,
-                uri: activeFile.fileUri,
-                displayName: activeFile.displayName,
-                sizeBytes,
-                mimeType: activeFile.mimeType,
-              }),
-            }
-          : undefined,
-        videoMetadataApplied: {
-          startOffset: scope === 'scene' ? startOffset : undefined,
-          endOffset: scope === 'scene' ? endOffset : undefined,
-          fps,
+              startOffset: isFragment ? startOffset : undefined,
+              endOffset: isFragment ? endOffset : undefined,
+              fps: settings.fps,
+            }),
+            { text: `${scopeContext}\n\nPregunta: ${prompt.trim()}` },
+          ],
         },
-      });
-    } catch (sdkError: unknown) {
-      const sdkMessage =
-        sdkError instanceof Error
-          ? sdkError.message
-          : 'Error al invocar gemini-4-argon con la File API.';
-      return NextResponse.json({ error: sdkMessage }, { status: 502 });
-    }
+      ],
+      config: {
+        systemInstruction: CINEMA_SYSTEM_INSTRUCTION,
+        thinkingConfig: { thinkingLevel: ThinkingLevel[settings.thinkingLevel] },
+      },
+    });
+
+    const answerText =
+      response.text || 'No he encontrado nada que comentar sobre esta pregunta.';
+
+    return NextResponse.json({
+      answer: answerText,
+      model: GEMINI_VIDEO_MODEL,
+      ...settings,
+      citations: extractTimestampCitations(answerText),
+      file: {
+        expirationTime: activeFile.expirationTime,
+        durationSeconds: activeFile.durationSeconds,
+      },
+    });
   } catch (error: unknown) {
     const message =
-      error instanceof Error ? error.message : 'Error interno al procesar el análisis de vídeo.';
-    return NextResponse.json({ error: message }, { status: 500 });
+      error instanceof Error ? error.message : 'Error al analizar el vídeo.';
+    const status = message.includes('VIDEO_EXPIRED') ? 410 : 500;
+    return NextResponse.json({ error: message }, { status });
   }
 }

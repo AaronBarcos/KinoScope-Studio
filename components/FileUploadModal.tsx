@@ -1,21 +1,18 @@
 'use client';
 
 import React, { useRef, useState } from 'react';
-import { Upload, X, FileVideo, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
+import { Upload, X, FileVideo, AlertCircle, Loader2, Clock } from 'lucide-react';
 import {
   calculateChunkPlan,
   DEFAULT_CHUNK_SIZE_BYTES,
   formatAnalysisErrorMessage,
   formatByteSize,
-  formatSecondsToTimecode,
+  formatFriendlyDuration,
+  probeLocalVideoMetadata,
   safeParseJsonResponse,
   UploadedGeminiVideo,
   validateVideoFile,
 } from '@/lib/video-utils';
-import {
-  cacheVideoBlobInBrowser,
-  probeLocalVideoMetadata,
-} from '@/lib/client-video-cache';
 
 interface FileUploadModalProps {
   isOpen: boolean;
@@ -23,239 +20,160 @@ interface FileUploadModalProps {
   onUploadComplete: (video: UploadedGeminiVideo) => void;
 }
 
-export function FileUploadModal({
-  isOpen,
-  onClose,
-  onUploadComplete,
-}: FileUploadModalProps) {
+type GeminiFileResponse = {
+  name?: string;
+  displayName?: string;
+  uri?: string;
+  mimeType?: string;
+  sizeBytes?: number;
+  state?: UploadedGeminiVideo['state'];
+  durationSeconds?: number;
+  expirationTime?: string;
+};
+
+export function FileUploadModal({ isOpen, onClose, onUploadComplete }: FileUploadModalProps) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [probedMeta, setProbedMeta] = useState<{
-    durationSeconds?: number;
-    aspectRatio?: string;
-  }>({});
-  const [customTitle, setCustomTitle] = useState('');
-  const [validationError, setValidationError] = useState<string | null>(null);
-  const [uploadStage, setUploadStage] = useState<
-    'idle' | 'transferring' | 'processing' | 'error'
-  >('idle');
+  const [probedMeta, setProbedMeta] = useState<{ durationSeconds?: number; aspectRatio?: string }>({});
+  const [error, setError] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
   const [progressPct, setProgressPct] = useState(0);
-  const [uploadedBytes, setUploadedBytes] = useState(0);
   const [statusMessage, setStatusMessage] = useState('');
+  const [isDragging, setIsDragging] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   if (!isOpen) return null;
 
-  const handleFileSelect = async (file: File | null) => {
-    setValidationError(null);
-    setUploadStage('idle');
-    setProgressPct(0);
-    setUploadedBytes(0);
+  const reset = () => {
+    setSelectedFile(null);
     setProbedMeta({});
+    setError(null);
+    setProgressPct(0);
+    setStatusMessage('');
+  };
 
+  const handleClose = () => {
+    if (isUploading) return;
+    reset();
+    onClose();
+  };
+
+  const handleFileSelect = async (file: File | null) => {
+    setError(null);
+    setProbedMeta({});
     if (!file) {
       setSelectedFile(null);
       return;
     }
-
-    const check = validateVideoFile({
-      name: file.name,
-      size: file.size,
-      type: file.type,
-    });
-
+    const check = validateVideoFile({ name: file.name, size: file.size, type: file.type });
     if (!check.valid) {
       setSelectedFile(null);
-      setValidationError(check.error || 'Archivo de vídeo no válido.');
+      setError(check.error || 'Este archivo no es un vídeo válido.');
       return;
     }
-
     setSelectedFile(file);
-    if (!customTitle) {
-      setCustomTitle(file.name);
-    }
-
-    const meta = await probeLocalVideoMetadata(file);
-    setProbedMeta(meta);
+    setProbedMeta(await probeLocalVideoMetadata(file));
   };
 
-  const pollUntilActive = async (fileName: string): Promise<{
-    state: 'PROCESSING' | 'ACTIVE' | 'FAILED';
-    uri?: string;
-    durationSeconds?: number;
-  }> => {
-    for (let attempt = 0; attempt < 40; attempt++) {
+  const waitUntilReady = async (fileName: string): Promise<GeminiFileResponse> => {
+    for (let attempt = 0; attempt < 120; attempt++) {
       const res = await fetch(`/api/files/status?name=${encodeURIComponent(fileName)}`);
-      const parsed = await safeParseJsonResponse<{
-        file?: {
-          state?: 'PROCESSING' | 'ACTIVE' | 'FAILED';
-          uri?: string;
-          durationSeconds?: number;
-        };
-        error?: string;
-      }>(res, 'File API Status');
-      if (!parsed.ok || !parsed.data) {
-        throw new Error(parsed.error || 'Error al verificar el estado en la File API.');
+      const parsed = await safeParseJsonResponse<{ file?: GeminiFileResponse }>(res, 'Estado del vídeo');
+      if (!parsed.ok || !parsed.data?.file) {
+        throw new Error(parsed.error || 'No se pudo comprobar el estado del vídeo.');
       }
-      const st = parsed.data.file?.state as 'PROCESSING' | 'ACTIVE' | 'FAILED';
-      if (st === 'ACTIVE') {
-        return {
-          state: 'ACTIVE',
-          uri: parsed.data.file?.uri,
-          durationSeconds: parsed.data.file?.durationSeconds,
-        };
+      const file = parsed.data.file;
+      if (file.state === 'ACTIVE') return file;
+      if (file.state === 'FAILED' || file.state === 'EXPIRED') {
+        throw new Error('Gemini no ha podido procesar este vídeo. Prueba con otro archivo.');
       }
-      if (st === 'FAILED') {
-        throw new Error('La File API de Gemini reportó un fallo al procesar el contenedor de vídeo.');
-      }
-      setStatusMessage(
-        `Gemini File API indexando fotogramas y pista de audio (${attempt + 1}/40)...`
-      );
       await new Promise((r) => setTimeout(r, 2500));
     }
-    return { state: 'PROCESSING' };
+    throw new Error('El vídeo está tardando demasiado en prepararse. Inténtalo de nuevo más tarde.');
   };
 
-  const handleStartUpload = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!selectedFile) {
-      setValidationError('Por favor selecciona un archivo de vídeo antes de iniciar la subida.');
-      return;
-    }
-
+  const handleStartUpload = async () => {
+    if (!selectedFile) return;
     const check = validateVideoFile({
       name: selectedFile.name,
       size: selectedFile.size,
       type: selectedFile.type,
     });
-
     if (!check.valid) {
-      setValidationError(check.error || 'Archivo no válido.');
+      setError(check.error || 'Este archivo no es un vídeo válido.');
       return;
     }
 
     try {
-      setValidationError(null);
-      setUploadStage('transferring');
-      setProgressPct(2);
+      setError(null);
+      setIsUploading(true);
+      setProgressPct(1);
+      setStatusMessage('Subiendo tu vídeo…');
 
       const uploadId = `vid_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       const chunks = calculateChunkPlan(selectedFile.size, DEFAULT_CHUNK_SIZE_BYTES);
 
       for (const chunk of chunks) {
-        const blobSlice = selectedFile.slice(chunk.start, chunk.end);
-        setStatusMessage(
-          `Transfiriendo bloque ${chunk.index + 1} de ${chunks.length} (${formatByteSize(chunk.end)} / ${formatByteSize(selectedFile.size)})...`
-        );
-
-        const chunkRes = await fetch(
+        const res = await fetch(
           `/api/files/upload?action=chunk&uploadId=${encodeURIComponent(uploadId)}&chunkIndex=${chunk.index}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/octet-stream' },
-            body: blobSlice,
+            body: selectedFile.slice(chunk.start, chunk.end),
           }
         );
-
-        const chunkParsed = await safeParseJsonResponse<{ error?: string }>(
-          chunkRes,
-          'Subida de bloque'
-        );
-        if (!chunkParsed.ok) {
-          throw new Error(chunkParsed.error || 'Fallo al transferir bloque de vídeo.');
-        }
-
-        setUploadedBytes(chunk.end);
-        setProgressPct(Math.round((chunk.end / selectedFile.size) * 75));
+        const parsed = await safeParseJsonResponse(res, 'Subida');
+        if (!parsed.ok) throw new Error(parsed.error || 'Se ha cortado la subida.');
+        setProgressPct(Math.round((chunk.end / selectedFile.size) * 80));
       }
 
-      setStatusMessage('Registrando vídeo en Gemini File API (ai.files.upload)...');
-      setProgressPct(82);
+      setStatusMessage('Enviando el vídeo a la IA…');
+      setProgressPct(85);
 
-      const finalDisplayName = customTitle.trim() || selectedFile.name;
-      const finalMimeType = check.normalizedMimeType || selectedFile.type || 'video/mp4';
-
+      const displayName = selectedFile.name;
+      const mimeType = check.normalizedMimeType || selectedFile.type || 'video/mp4';
       const finalizeRes = await fetch('/api/files/upload?action=finalize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          uploadId,
-          mimeType: finalMimeType,
-          displayName: finalDisplayName,
-          durationSeconds: probedMeta.durationSeconds,
-          aspectRatio: probedMeta.aspectRatio,
-        }),
+        body: JSON.stringify({ uploadId, mimeType, displayName }),
       });
-
-      const finalizeParsed = await safeParseJsonResponse<{
-        file?: {
-          name?: string;
-          uri?: string;
-          mimeType?: string;
-          state?: 'PROCESSING' | 'ACTIVE' | 'FAILED';
-          durationSeconds?: number;
-          streamUrl?: string;
-          expirationTime?: string;
-        };
-        error?: string;
-      }>(finalizeRes, 'Registro en Gemini File API');
-      if (!finalizeParsed.ok || !finalizeParsed.data?.file) {
-        throw new Error(finalizeParsed.error || 'Error al registrar el archivo en Gemini File API.');
+      const finalizeParsed = await safeParseJsonResponse<{ file?: GeminiFileResponse }>(
+        finalizeRes,
+        'Subida'
+      );
+      if (!finalizeParsed.ok || !finalizeParsed.data?.file?.name) {
+        throw new Error(finalizeParsed.error || 'No se ha podido guardar el vídeo.');
       }
 
-      const geminiFile = finalizeParsed.data.file;
-      setUploadStage('processing');
-      setProgressPct(90);
-
-      let finalState: 'PROCESSING' | 'ACTIVE' | 'FAILED' = geminiFile.state || 'PROCESSING';
-      let remoteDurationSec: number | undefined = geminiFile.durationSeconds;
-
-      if (finalState === 'PROCESSING' && geminiFile.name) {
-        const polled = await pollUntilActive(geminiFile.name);
-        finalState = polled.state;
-        if (polled.durationSeconds) {
-          remoteDurationSec = polled.durationSeconds;
-        }
+      let geminiFile = finalizeParsed.data.file;
+      if (geminiFile.state !== 'ACTIVE') {
+        setStatusMessage('La IA está viendo tu vídeo por primera vez…');
+        setProgressPct(92);
+        geminiFile = { ...geminiFile, ...(await waitUntilReady(geminiFile.name!)) };
       }
 
       setProgressPct(100);
-      const localUrl = URL.createObjectURL(selectedFile);
-      const resolvedDuration = probedMeta.durationSeconds || remoteDurationSec;
 
-      await cacheVideoBlobInBrowser({
-        fileName: geminiFile.name || '',
-        displayName: finalDisplayName,
-        uri: geminiFile.uri,
-        sizeBytes: selectedFile.size,
-        mimeType: geminiFile.mimeType || finalMimeType,
-        durationSeconds: resolvedDuration,
-        aspectRatio: probedMeta.aspectRatio,
-        blob: selectedFile,
-      });
-
-      const newVideo: UploadedGeminiVideo = {
-        id: geminiFile.name || `local-${Date.now()}`,
-        name: geminiFile.name || `local-${Date.now()}`,
-        displayName: finalDisplayName,
+      onUploadComplete({
+        id: geminiFile.name!,
+        name: geminiFile.name!,
+        displayName: geminiFile.displayName || displayName,
         uri: geminiFile.uri || '',
-        mimeType: geminiFile.mimeType || finalMimeType,
+        mimeType: geminiFile.mimeType || mimeType,
         sizeBytes: selectedFile.size,
-        state: finalState,
-        durationSeconds: resolvedDuration,
-        localObjectUrl: localUrl,
-        streamUrl: geminiFile.streamUrl,
-        hasServerCache: true,
-        isPermanentVault: true,
+        state: 'ACTIVE',
+        durationSeconds: probedMeta.durationSeconds || geminiFile.durationSeconds,
+        aspectRatio: probedMeta.aspectRatio,
+        localObjectUrl: URL.createObjectURL(selectedFile),
         expirationTime: geminiFile.expirationTime,
-        aspectRatio: probedMeta.aspectRatio || '16:9 / Nativo',
         createdAt: new Date().toISOString(),
-      };
-
-      onUploadComplete(newVideo);
+      });
+      setIsUploading(false);
+      reset();
       onClose();
     } catch (err: unknown) {
-      setUploadStage('error');
-      setValidationError(formatAnalysisErrorMessage(err));
+      setIsUploading(false);
+      setError(formatAnalysisErrorMessage(err));
     }
   };
 
@@ -264,155 +182,143 @@ export function FileUploadModal({
       role="dialog"
       aria-modal="true"
       aria-labelledby="upload-modal-title"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+      onClick={handleClose}
     >
-      <div className="w-full max-w-xl rounded-xl border border-slate-800 bg-slate-900 p-6 shadow-2xl">
-        <div className="flex items-center justify-between pb-4 border-b border-slate-800">
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="kino-fade-in w-full max-w-lg rounded-3xl border border-white/10 bg-[#16181e] p-6 sm:p-7 shadow-2xl"
+      >
+        <div className="flex items-start justify-between gap-4">
           <div>
-            <h2
-              id="upload-modal-title"
-              className="text-lg font-display font-semibold text-white"
-            >
-              Subir Vídeo a Gemini File API (Hasta 2.00 GB)
+            <h2 id="upload-modal-title" className="font-display text-2xl font-semibold text-white">
+              Sube un vídeo
             </h2>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Transmisión segmentada compatible con contenedores MP4, MOV, WebM, MPEG y AVI para gemini-4-argon
+            <p className="mt-1 text-sm text-zinc-400">
+              Después podrás hacerle todas las preguntas que quieras.
             </p>
           </div>
           <button
             type="button"
-            onClick={onClose}
-            aria-label="Cerrar ventana de subida"
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+            onClick={handleClose}
+            disabled={isUploading}
+            aria-label="Cerrar"
+            className="p-2 -m-1 rounded-full text-zinc-400 hover:text-white hover:bg-white/5 transition-colors disabled:opacity-40"
           >
-            <X className="w-4 h-4" />
+            <X className="w-5 h-5" />
           </button>
         </div>
 
-        <form onSubmit={handleStartUpload} className="mt-5 space-y-4">
-          <div>
-            <label
-              htmlFor="video-title-input"
-              className="block text-xs font-medium text-slate-300 mb-1.5"
-            >
-              Título de la Bobina o Película
-            </label>
-            <input
-              id="video-title-input"
-              type="text"
-              value={customTitle}
-              onChange={(e) => setCustomTitle(e.target.value)}
-              placeholder="Ej. Secuencia_Climax_Montaje_v3.mp4"
-              className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3.5 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-amber-500 focus:outline-none"
-            />
-          </div>
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={() => !isUploading && fileInputRef.current?.click()}
+          onKeyDown={(e) => {
+            if ((e.key === 'Enter' || e.key === ' ') && !isUploading) fileInputRef.current?.click();
+          }}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setIsDragging(true);
+          }}
+          onDragLeave={() => setIsDragging(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setIsDragging(false);
+            if (!isUploading && e.dataTransfer.files?.[0]) {
+              void handleFileSelect(e.dataTransfer.files[0]);
+            }
+          }}
+          className={`mt-6 cursor-pointer rounded-2xl border-2 border-dashed p-8 text-center transition-colors ${
+            isDragging
+              ? 'border-amber-400 bg-amber-400/5'
+              : 'border-white/10 hover:border-amber-400/50 bg-white/[0.02]'
+          } ${isUploading ? 'pointer-events-none opacity-70' : ''}`}
+        >
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="video/*"
+            onChange={(e) => void handleFileSelect(e.target.files?.[0] || null)}
+            className="sr-only"
+          />
+          {selectedFile ? (
+            <div className="space-y-2">
+              <FileVideo className="w-10 h-10 text-amber-400 mx-auto" />
+              <p className="text-base font-medium text-zinc-100 break-all">{selectedFile.name}</p>
+              <p className="text-sm text-zinc-400">
+                {formatByteSize(selectedFile.size)}
+                {probedMeta.durationSeconds
+                  ? ` · ${formatFriendlyDuration(probedMeta.durationSeconds)}`
+                  : ''}
+              </p>
+              {!isUploading && <p className="text-xs text-zinc-500">Haz clic para elegir otro</p>}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <div className="w-14 h-14 rounded-2xl bg-amber-400/10 flex items-center justify-center mx-auto">
+                <Upload className="w-6 h-6 text-amber-400" />
+              </div>
+              <p className="text-base font-medium text-zinc-100">
+                Arrastra tu vídeo aquí o haz clic para elegirlo
+              </p>
+              <p className="text-sm text-zinc-500">MP4, MOV, WebM… hasta 2 GB</p>
+            </div>
+          )}
+        </div>
 
-          <div>
-            <label
-              htmlFor="video-file-input"
-              className="block text-xs font-medium text-slate-300 mb-1.5"
-            >
-              Archivo de Vídeo Local (Máximo 2 GB)
-            </label>
-            <div
-              onClick={() => fileInputRef.current?.click()}
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => {
-                e.preventDefault();
-                if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-                  handleFileSelect(e.dataTransfer.files[0]);
-                }
-              }}
-              className="cursor-pointer rounded-xl border border-dashed border-slate-700 bg-slate-950/70 p-6 text-center hover:border-amber-500/60 transition-colors"
-            >
-              <input
-                ref={fileInputRef}
-                id="video-file-input"
-                type="file"
-                accept="video/mp4,video/quicktime,video/webm,video/mpeg,video/x-msvideo,video/*"
-                onChange={(e) => handleFileSelect(e.target.files?.[0] || null)}
-                className="sr-only"
+        {isUploading && (
+          <div className="mt-5 space-y-2">
+            <div className="flex items-center justify-between text-sm">
+              <span className="flex items-center gap-2 text-zinc-200">
+                <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
+                {statusMessage}
+              </span>
+              <span className="text-zinc-400">{progressPct}%</span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-white/5">
+              <div
+                style={{ width: `${progressPct}%` }}
+                className="h-full rounded-full bg-gradient-to-r from-amber-500 to-amber-300 transition-all duration-300"
               />
-              <Upload className="w-7 h-7 text-amber-400 mx-auto mb-2" />
-              {selectedFile ? (
-                <div className="space-y-1">
-                  <p className="text-sm font-medium text-slate-100 flex items-center justify-center gap-2">
-                    <FileVideo className="w-4 h-4 text-amber-400 shrink-0" />
-                    <span>{selectedFile.name}</span>
-                  </p>
-                  <p className="text-xs font-mono tabular-nums text-slate-400">
-                    {formatByteSize(selectedFile.size)} · {selectedFile.type || 'video/mp4'}
-                    {probedMeta.durationSeconds
-                      ? ` · Duración: ${formatSecondsToTimecode(probedMeta.durationSeconds)}`
-                      : ''}
-                    {probedMeta.aspectRatio ? ` · ${probedMeta.aspectRatio}` : ''}
-                  </p>
-                </div>
-              ) : (
-                <div className="space-y-1">
-                  <p className="text-sm font-medium text-slate-200">
-                    Haz clic para seleccionar un vídeo o arrástralo aquí
-                  </p>
-                  <p className="text-xs text-slate-400 font-mono tabular-nums">
-                    Límite File API: 2.00 GB · Bloques de subida automática de 8 MB
-                  </p>
-                </div>
-              )}
             </div>
+            <p className="text-xs text-zinc-500">No cierres esta ventana hasta que termine.</p>
           </div>
+        )}
 
-          {validationError && (
-            <div
-              role="alert"
-              className="flex items-start gap-2.5 rounded-lg border border-red-900/70 bg-red-950/40 p-3 text-xs text-red-200"
-            >
-              <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-              <span>{validationError}</span>
-            </div>
-          )}
-
-          {(uploadStage === 'transferring' || uploadStage === 'processing') && (
-            <div className="space-y-2 rounded-lg border border-slate-800 bg-slate-950 p-3.5">
-              <div className="flex items-center justify-between text-xs">
-                <span className="flex items-center gap-2 text-slate-200 font-medium">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
-                  {statusMessage}
-                </span>
-                <span className="font-mono tabular-nums text-amber-400">{progressPct}%</span>
-              </div>
-              <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
-                <div
-                  style={{ width: `${progressPct}%` }}
-                  className="h-full bg-amber-400 transition-all duration-200"
-                />
-              </div>
-              {selectedFile && (
-                <div className="flex justify-between text-[11px] font-mono tabular-nums text-slate-400">
-                  <span>Transferido: {formatByteSize(uploadedBytes)}</span>
-                  <span>Total: {formatByteSize(selectedFile.size)}</span>
-                </div>
-              )}
-            </div>
-          )}
-
-          <div className="flex items-center justify-end gap-3 pt-2 border-t border-slate-800">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 rounded-lg border border-slate-800 bg-slate-950 text-xs font-medium text-slate-300 hover:text-white transition-colors whitespace-nowrap shrink-0"
-            >
-              Cancelar
-            </button>
-            <button
-              type="submit"
-              disabled={uploadStage === 'transferring' || uploadStage === 'processing'}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-amber-500 text-slate-950 text-xs font-semibold hover:bg-amber-400 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
-            >
-              <CheckCircle2 className="w-4 h-4" />
-              <span>Subir a File API e Indexar</span>
-            </button>
+        {error && (
+          <div
+            role="alert"
+            className="mt-5 flex items-start gap-2.5 rounded-2xl bg-red-500/10 border border-red-500/20 p-3.5 text-sm text-red-200"
+          >
+            <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+            <span>{error}</span>
           </div>
-        </form>
+        )}
+
+        <div className="mt-5 flex items-center gap-2 text-xs text-zinc-500">
+          <Clock className="w-3.5 h-3.5 shrink-0" />
+          <span>El vídeo estará disponible para preguntas durante 48 horas.</span>
+        </div>
+
+        <div className="mt-6 flex items-center justify-end gap-3">
+          <button
+            type="button"
+            onClick={handleClose}
+            disabled={isUploading}
+            className="px-4 py-2.5 rounded-full text-sm font-medium text-zinc-300 hover:text-white hover:bg-white/5 transition-colors disabled:opacity-40"
+          >
+            Cancelar
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleStartUpload()}
+            disabled={!selectedFile || isUploading}
+            className="flex items-center gap-2 px-5 py-2.5 rounded-full bg-amber-400 text-zinc-950 text-sm font-semibold hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          >
+            {isUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+            <span>{isUploading ? 'Subiendo…' : 'Subir vídeo'}</span>
+          </button>
+        </div>
       </div>
     </div>
   );
